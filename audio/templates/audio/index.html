@@ -1,0 +1,26 @@
+{% extends 'audio/base.html' %}
+{% load static %}
+{% block content %}
+<div class="row justify-content-center">
+<div class="col-lg-7">
+<div class="card shadow">
+<div class="card-body p-4">
+<h3 class="mb-3">Upload audio to soften & suppress triggers</h3>
+<form method="post" enctype="multipart/form-data" action="{% url 'audio:upload' %}">
+{% csrf_token %}
+<div class="mb-3">{{ form.audio.label_tag }} {{ form.audio }}</div>
+<div class="form-check mb-2">{{ form.apply_base_denoise }} {{ form.apply_base_denoise.label_tag }}</div>
+<div class="form-check mb-2">{{ form.suppress_triggers }} {{ form.suppress_triggers.label_tag }}</div>
+<div class="mb-3">
+<label class="form-label">Trigger sensitivity</label>
+{{ form.trigger_sensitivity }}
+<div class="form-text">Lower = more aggressive suppression.</div>
+</div>
+<button type="submit" class="btn btn-primary">Process</button>
+</form>
+<p class="mt-3 text-muted small">Accepted: WAV (16k–48kHz). Keep clips short (≤20s) for quick demo.</p>
+</div>
+</div>
+</div>
+</div>
+{% endblock %}

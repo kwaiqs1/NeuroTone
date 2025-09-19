@@ -1,0 +1,37 @@
+{% extends 'audio/base.html' %}
+{% block content %}
+<div class="row g-4">
+<div class="col-md-6">
+<div class="card">
+<div class="card-body">
+<h5>Original</h5>
+<audio controls src="{{ object.original_file.url }}"></audio>
+</div>
+</div>
+</div>
+<div class="col-md-6">
+<div class="card">
+<div class="card-body">
+<h5>Processed</h5>
+{% if object.processed_file %}
+<audio controls src="{{ object.processed_file.url }}"></audio>
+{% else %}
+<p>Processing failed. Check server logs.</p>
+{% endif %}
+</div>
+</div>
+</div>
+</div>
+
+
+{% if notes %}
+<div class="row mt-4">
+<div class="col">
+<div class="alert alert-info">
+<strong>Detection notes:</strong>
+<pre class="mb-0" style="white-space: pre-wrap;">{{ notes }}</pre>
+</div>
+</div>
+</div>
+{% endif %}
+{% endblock %}

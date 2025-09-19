@@ -1,0 +1,5 @@
+body { background: #0b0e12; color: #e6e8ea; }
+.card { border-radius: 1rem; background: #151a21; color: #e6e8ea; }
+.navbar { border-bottom: 1px solid rgba(255,255,255,0.1); }
+.btn-primary { background: #6c8cff; border: none; }
+.form-control, input, select { background: #0f141b; color: #e6e8ea; border: 1px solid #2a3038; }
