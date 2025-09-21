@@ -10,3 +10,4 @@ tensorflow-hub==0.16.1
 tflite-support==0.4.3
 noisereduce==3.0.0
 webrtcvad==2.0.10
+sounddevice==0.4.6
