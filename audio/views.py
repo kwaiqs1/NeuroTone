@@ -38,11 +38,25 @@ def upload_and_process(request):
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
 
 
+
+
+    ts = form.cleaned_data.get('trigger_sensitivity')
+    if ts in (None, ''):
+        ts = 0.15  # дефолт агрессивности
+
+    vs = form.cleaned_data.get('vacuum_strength')
+    if vs in (None, ''):
+        vs = 0.8  # дефолт силы "вакуума"
+
+
     # Run pipeline
     cfg = PipelineConfig(
-        base_denoise=form.cleaned_data['apply_base_denoise'],
-        suppress_triggers=form.cleaned_data['suppress_triggers'],
-        trigger_sensitivity=form.cleaned_data['trigger_sensitivity'],
+        base_denoise=form.cleaned_data.get('apply_base_denoise', True),
+        suppress_triggers=form.cleaned_data.get('suppress_triggers', True),
+        trigger_sensitivity=float(ts),
+        preserve_speech=form.cleaned_data.get('preserve_speech', True),
+        vacuum_mode=form.cleaned_data.get('vacuum_mode', True),
+        vacuum_strength=float(vs),
     )
 
 

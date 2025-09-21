@@ -9,4 +9,4 @@ tensorflow-cpu==2.15.0
 tensorflow-hub==0.16.1
 tflite-support==0.4.3
 noisereduce==3.0.0
-py-webrtcvad==2.0.10
+webrtcvad==2.0.10
