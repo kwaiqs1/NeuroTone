@@ -4,35 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="f0027fec-8a9e-4fb9-bfe2-60e113c883e3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/NeuroTone.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/admin.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/apps.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/forms.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/migrations/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/models.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/pipeline.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/static/audio/styles.css" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/templates/audio/base.html" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/templates/audio/detail.html" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/templates/audio/index.html" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/tests.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/urls.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/audio/views.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/calmcity/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/calmcity/asgi.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/calmcity/settings.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/calmcity/urls.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/calmcity/wsgi.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/manage.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-    </list>
+    <list default="true" id="f0027fec-8a9e-4fb9-bfe2-60e113c883e3" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
