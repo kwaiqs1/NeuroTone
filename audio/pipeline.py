@@ -1,4 +1,7 @@
 # audio/pipeline.py
+# Жёсткая оффлайн-обработка: агрессивный спектральный денойз + "вакуум" вне речи (VAD)
+# + покадровые триггеры YAMNet + подавление транзиентов (spectral flux).
+
 import wave
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -27,12 +30,12 @@ TRIGGER_KEYWORDS = {
 class PipelineConfig:
     base_denoise: bool = True
     suppress_triggers: bool = True
-    trigger_sensitivity: float = 0.15
+    trigger_sensitivity: float = 0.12   # ниже -> агрессивнее
     preserve_speech: bool = True
     vacuum_mode: bool = True
-    vacuum_strength: float = 0.8  # 0..1
+    vacuum_strength: float = 0.9        # 0..1; вне речи глушим фон очень сильно
 
-# -------- WAV I/O (без soundfile) --------
+# ---------- WAV I/O ----------
 def _read_wav_mono_float(path: str) -> Tuple[np.ndarray, int]:
     with wave.open(path, 'rb') as wf:
         nch = wf.getnchannels()
@@ -68,26 +71,25 @@ def _resample_to(y: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
     up, down = target_sr // g, sr // g
     return resample_poly(y, up, down).astype(np.float32)
 
-# -------- Пайплайн --------
+# ---------- основа ----------
 class CalmCityPipeline:
     def __init__(self):
         if not getattr(tf, "__version__", None):
-            tf.__version__ = "2.15.0"
-        self.model = hub.load(YAMNET_HANDLE)
+            tf.__version__ = "2.15.0"  # предохранитель для TF-Hub
+        self.yamnet = hub.load(YAMNET_HANDLE)
         self.class_map = self._load_class_map()
-        # WebRTC VAD (0..3) — 2: баланс, 3: максимально агрессивный
-        self.vad = webrtcvad.Vad(2)
+        self.vad = webrtcvad.Vad(2)  # 0..3 (2 — баланс, 3 — максимум)
 
     def _load_class_map(self):
-        class_map_path = self.model.class_map_path().numpy().decode('utf-8')
+        class_map_path = self.yamnet.class_map_path().numpy().decode('utf-8')
         with tf.io.gfile.GFile(class_map_path, 'r') as f:
             import csv
             return [row['display_name'] for row in csv.DictReader(f)]
 
-    # --- покадровые триггеры (YAMNet) ---
+    # --- YAMNet покадрово ---
     def _frame_trigger_scores(self, y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
         y16 = _resample_to(y, sr, 16000)
-        scores, _, _ = self.model(y16)  # [T, 521]
+        scores, _, _ = self.yamnet(y16)     # [T, 521]
         S = scores.numpy()
         out = {}
         for key, words in TRIGGER_KEYWORDS.items():
@@ -96,129 +98,190 @@ class CalmCityPipeline:
             out[key] = S[:, idxs].max(axis=1) if idxs else np.zeros((S.shape[0],), dtype=np.float32)
         return out
 
-    # --- речь/не речь (WebRTC VAD) ---
-    def _vad_frames(self, y: np.ndarray, sr: int, aggressiveness: int = 2) -> np.ndarray:
-        # работаем на 16 кГц, шаг 20 мс (320 сэмплов)
+    # --- VAD (20 мс @ 16 кГц) ---
+    def _vad_flags(self, y: np.ndarray, sr: int, aggressiveness=2) -> np.ndarray:
         y16 = _resample_to(y, sr, 16000)
-        y16_i16 = np.clip(y16 * 32767, -32768, 32767).astype(np.int16)
-
-        frame_len = 320  # 20 ms @16k
-        n_frames = len(y16_i16) // frame_len
+        s = np.clip(y16 * 32767, -32768, 32767).astype(np.int16)
+        step = 320  # 20 ms
+        n = len(s) // step
         vad = webrtcvad.Vad(aggressiveness)
-        flags = np.zeros(n_frames, dtype=np.bool_)
-
-        for i in range(n_frames):
-            frame = y16_i16[i*frame_len:(i+1)*frame_len].tobytes()
+        flags = np.zeros(n, dtype=np.bool_)
+        for i in range(n):
+            frame = s[i*step:(i+1)*step].tobytes()
             try:
                 flags[i] = vad.is_speech(frame, 16000)
             except Exception:
                 flags[i] = False
-        return flags  # длиной T_vad
+        return flags
 
-    # --- плотный денойз ДО гейтинга ---
-    def _base_soft_denoise(self, y: np.ndarray, sr: int) -> np.ndarray:
-        if HAS_NOISEREDUCE:
-            # статционный режим; ощутимо убирает «шум комнаты/улицы»
-            return nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=0.95)
-        return y
+    # --- агрессивный базовый денойз (минимум-статистика + гейтинг/Винер) ---
+    def _aggressive_denoise_mask(self, Z: np.ndarray, fs: int, speech_mask_t: np.ndarray) -> np.ndarray:
+        # Z: [freq, time] complex
+        mag = np.abs(Z)
+        power = mag**2 + 1e-12
 
-    # --- «вакуум» + мультибэнд-гейтинг по триггерам ---
-    def _gate_with_vacuum(self, y: np.ndarray, sr: int,
-                          trig_frames: Dict[str, np.ndarray],
-                          vad_flags: np.ndarray,
-                          sensitivity: float,
-                          vacuum_on: bool,
-                          vacuum_strength: float,
-                          protect_speech: bool) -> np.ndarray:
+        # оценка шума по кадрам, где нет речи (если таких нет — возьмём 20-й перцентиль по времени)
+        T = power.shape[1]
+        if speech_mask_t.size > 0:
+            map_vad = np.minimum((np.arange(T) * speech_mask_t.size) // max(T, 1), speech_mask_t.size - 1)
+            non_speech = ~speech_mask_t[map_vad]
+        else:
+            non_speech = np.zeros(T, dtype=bool)
 
-        sensitivity = 0.15 if sensitivity in (None, '') else float(sensitivity)
-        vacuum_strength = 0.8 if vacuum_strength in (None, '') else float(vacuum_strength)
+        if non_speech.any():
+            noise_psd = np.median(power[:, non_speech], axis=1, keepdims=True)
+        else:
+            noise_psd = np.percentile(power, 20, axis=1, keepdims=True)
+
+        # Винер: H = SNR/(SNR+1), SNR ~ max(P/N - 1, 0)
+        snr = np.maximum(power / (noise_psd + 1e-12) - 1.0, 0.0)
+        H = snr / (snr + 1.0)
+
+        # Пол по усилению (жёсткий): −28..−32 dB
+        floor = 10 ** (-30 / 20)
+        H = np.clip(H, floor, 1.0)
+
+        # Чуть бережнее < 250 Гц (чтобы не "дышало")
+        # и в узкой области 1–4 кГц при речи (согласные/гласные)
+        f_bins = np.linspace(0, fs/2, Z.shape[0])
+        low = f_bins < 250
+        H[low, :] = np.maximum(H[low, :], 10 ** (-12/20))
+
+        return H
+
+    # --- детектор транзиентов (spectral flux) ---
+    def _transient_mask_t(self, Z: np.ndarray, fs: int) -> np.ndarray:
+        mag = np.abs(Z)
+        # позитивный спектральный поток в 2–9 кГц
+        f_bins = np.linspace(0, fs/2, Z.shape[0])
+        band = (f_bins >= 2000) & (f_bins <= 9000)
+        diff = np.maximum(mag[:, 1:] - mag[:, :-1], 0.0)
+        flux = diff[band, :].sum(axis=0)
+        # порог: медиана + 3*MAD
+        med = np.median(flux)
+        mad = np.median(np.abs(flux - med)) + 1e-9
+        thr = med + 3.0 * mad
+        mask_t = np.zeros(Z.shape[1], dtype=np.bool_)
+        mask_t[1:] = flux > thr
+        # расширим на соседние кадры
+        for i in range(1, len(mask_t)-1):
+            if mask_t[i]:
+                mask_t[i-1] = True
+                mask_t[i+1] = True
+        return mask_t
+
+    def _process_masking(self, y: np.ndarray, sr: int,
+                         trig_frames: Dict[str, np.ndarray],
+                         speech_flags: np.ndarray,
+                         sensitivity: float,
+                         vacuum_on: bool,
+                         vacuum_strength: float,
+                         protect_speech: bool) -> np.ndarray:
 
         # STFT
         nper, nover = 1024, 256
-        f, t, Z = stft(y, fs=sr, nperseg=nper, noverlap=nover)
-        M = Z.shape[1]
+        f, t, Z = stft(y, fs=sr, nperseg=nper, noverlap=nover)   # [F, T]
+        F, T = Z.shape
 
-        # маппинг временных индексов: STFT -> YAMNet/VAD
-        T_yam = next(iter(trig_frames.values())).shape[0] if trig_frames else 0
-        T_vad = len(vad_flags)
-        map_yam = np.minimum((np.arange(M) * max(T_yam,1)) // max(M,1), max(T_yam-1,0))
-        map_vad = np.minimum((np.arange(M) * max(T_vad,1)) // max(M,1), max(T_vad-1,0))
+        # базовая маска денойза
+        H_denoise = self._aggressive_denoise_mask(Z, sr, speech_flags)
 
-        thr = float(sensitivity)
+        # временная маска VAD в координаты STFT
+        if speech_flags.size > 0:
+            map_vad = np.minimum((np.arange(T) * speech_flags.size) // max(T, 1), speech_flags.size - 1)
+            vad_t = speech_flags[map_vad]
+        else:
+            vad_t = np.zeros(T, dtype=np.bool_)
 
-        # частотные полосы:
+        # покадровые триггеры YAMNet в координаты STFT
+        yam_t = {}
+        for key, arr in trig_frames.items():
+            map_y = np.minimum((np.arange(T) * arr.size) // max(T, 1), max(arr.size - 1, 0))
+            yam_t[key] = arr[map_y] if arr.size > 0 else np.zeros(T, dtype=np.float32)
+
+        # транзиенты (щелчки) как дополнительный супрессор
+        trans_t = self._transient_mask_t(Z, sr)
+
+        # начальная маска усиления
+        G = H_denoise.copy()
+
+        # "вакуум" вне речи: глобально прижмём фон
+        if vacuum_on:
+            base_vacuum = np.clip(1.0 - 0.85 * float(vacuum_strength), 0.03, 1.0)  # до ~−30 dB
+            for i in range(T):
+                if (not vad_t[i]) or (not protect_speech):
+                    G[:, i] *= base_vacuum
+
+        # частотные полосы для триггеров
         BANDS = {
             'clock':    [(2000, 9000)],
-            'keyboard': [(2000, 6000)],
-            'chewing':  [(200, 1200), (6000, 9500)]
+            'keyboard': [(2000, 6500)],
+            'chewing':  [(180, 1200), (6000, 9500)],
         }
+        f_bins = np.linspace(0, sr/2, F)
 
-        # глобальная «вакуумная» база (чем больше vacuum_strength, тем сильнее глушим фон вне речи)
-        # вне речи target_gain ~ 1 - (0.75 * strength)  (например, 0.8 → ~0.4 = −8 dB)
-        # в полосах триггеров — ещё сильнее (см. ниже)
-        base_vacuum = max(0.05, 1.0 - 0.75 * float(vacuum_strength))  # не ниже −26 dB вне-сеточно
+        thr = float(0.12 if sensitivity in (None, '') else sensitivity)
 
-        for i in range(M):
-            j_y = int(map_yam[i]) if T_yam > 0 else 0
-            j_v = int(map_vad[i]) if T_vad > 0 else 0
-            is_speech = bool(vad_flags[j_v]) if T_vad > 0 else False
+        # максимальное подавление (вне речи/триггер): почти в ноль
+        MIN_GAIN_OUT = 0.01   # ~−40 dB
+        # минимальное в речи: бережнее
+        MIN_GAIN_SPEECH = 0.12  # ~−18 dB
 
-            # стартовая маска кадра
-            frame_mask = np.ones_like(Z[:, i], dtype=np.float32)
+        for i in range(T):
+            is_speech = bool(vad_t[i])
 
-            # 1) «вакуум» (вне речи)
-            if vacuum_on and (not is_speech or not protect_speech):
-                frame_mask *= base_vacuum
+            # доп. гашение на транзиентах (2–9 кГц)
+            if trans_t[i]:
+                band = (f_bins >= 2000) & (f_bins <= 9000)
+                G[band, i] *= 0.15 if not is_speech else 0.35
 
-            # 2) триггеры — динамическая глубина, до полного «mute» вне речи
+            # триггеры YAMNet
             for key, bands in BANDS.items():
-                s = float(trig_frames.get(key, np.zeros((1,), np.float32))[j_y]) if T_yam > 0 else 0.0
+                s = float(yam_t.get(key, np.zeros((), np.float32))[i]) if key in yam_t else 0.0
                 if s > thr:
-                    # уровень «давления» от 0..1
-                    k = np.clip((s - thr) / max(1e-6, 1.0 - thr), 0.0, 1.0)
-
-                    # в речи: оставляем минимум ~−18 dB (0.12), чтобы не ломать артикуляцию
-                    # вне речи: можно почти в "0" (почти полное удаление)
-                    min_gain_in_speech = 0.12
-                    min_gain_out_speech = 0.02
-
-                    depth = 0.5 + 0.5 * k  # 0.5..1.0
-                    if is_speech and protect_speech:
-                        gain = np.clip(1.0 - depth, min_gain_in_speech, 1.0)
-                    else:
-                        gain = np.clip(1.0 - 1.2 * depth, min_gain_out_speech, 1.0)
-
+                    k = np.clip((s - thr) / max(1e-6, 1.0 - thr), 0.0, 1.0)  # 0..1
+                    # в речи гасятся мягче, вне — максимально
+                    target_min = MIN_GAIN_SPEECH if (is_speech and protect_speech) else MIN_GAIN_OUT
+                    # глубина 0.6..1.0 (очень сильно)
+                    depth = 0.6 + 0.4 * k
+                    gain = np.clip(1.0 - depth, target_min, 1.0)
                     for (lo, hi) in bands:
-                        band = (f >= lo) & (f <= hi)
-                        frame_mask[band] *= gain
+                        band = (f_bins >= lo) & (f_bins <= hi)
+                        G[band, i] *= gain
 
-            Z[:, i] *= frame_mask
-
-        _, y_out = istft(Z, fs=sr, nperseg=nper, noverlap=nover)
+        # применяем маску и обратно в сигнал
+        Z_proc = Z * G
+        _, y_out = istft(Z_proc, fs=sr, nperseg=nper, noverlap=nover)
         return y_out.astype(np.float32)
 
     def process_file(self, in_path: str, out_path: str, config: PipelineConfig) -> Dict:
+        # безопасность для чисел
+        sens = 0.12 if config.trigger_sensitivity in (None, '') else float(config.trigger_sensitivity)
+        vacs = 0.9  if config.vacuum_strength    in (None, '') else float(config.vacuum_strength)
+
         y, sr = _read_wav_mono_float(in_path)
 
         # 1) покадровые триггеры
         trig_frames = self._frame_trigger_scores(y, sr) if config.suppress_triggers else {}
 
-        # 2) денойз до гейтинга
+        # 2) базовый денойз (жёсткий)
         if config.base_denoise:
-            y = self._base_soft_denoise(y, sr)
+            # если есть noisereduce — слегка предварительно «подсушим»,
+            # основное всё равно сделает наш маскер
+            if HAS_NOISEREDUCE:
+                y = nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=0.95)
 
         # 3) VAD (речь)
-        vad_flags = self._vad_frames(y, sr, aggressiveness=2) if config.preserve_speech else np.zeros((0,), dtype=np.bool_)
+        speech_flags = self._vad_flags(y, sr, aggressiveness=2) if config.preserve_speech else np.zeros((0,), dtype=np.bool_)
 
-        # 4) вакуум + триггеры
-        y = self._gate_with_vacuum(
+        # 4) маскирование (вакуум + триггеры + транзиенты + денойз)
+        y = self._process_masking(
             y, sr,
             trig_frames=trig_frames,
-            vad_flags=vad_flags,
-            sensitivity=config.trigger_sensitivity,
+            speech_flags=speech_flags,
+            sensitivity=sens,
             vacuum_on=config.vacuum_mode,
-            vacuum_strength=config.vacuum_strength,
+            vacuum_strength=vacs,
             protect_speech=config.preserve_speech
         )
 
