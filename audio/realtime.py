@@ -8,7 +8,9 @@ from typing import Optional, Tuple, Dict
 
 import numpy as np
 import sounddevice as sd
-from scipy.signal import iirnotch, sosfilt, sosfilt_zi, get_window, rfft, irfft
+from scipy.signal import iirnotch, sosfilt, sosfilt_zi
+from scipy.signal.windows import get_window
+from scipy.fft import rfft, irfft
 
 import tensorflow as tf
 import tensorflow_hub as hub
