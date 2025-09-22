@@ -8,13 +8,15 @@ from .rt_manager import RTSessionManager
 
 
 def realtime_page(request: HttpRequest):
-    """Страница с UI."""
     return render(request, "audio/realtime.html")
 
 
 def api_devices(request: HttpRequest):
-    mgr = RTSessionManager.instance()
-    return JsonResponse(mgr.list_devices())
+    try:
+        mgr = RTSessionManager.instance()
+        return JsonResponse(mgr.list_devices())
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 @csrf_exempt
@@ -22,11 +24,11 @@ def api_rt_start(request: HttpRequest):
     if request.method != "POST":
         return JsonResponse({"error": "POST only"}, status=405)
     try:
-        payload = json.loads(request.body.decode("utf-8"))
-    except Exception:
-        payload = request.POST.dict()
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            payload = request.POST.dict()
 
-    try:
         mgr = RTSessionManager.instance()
         res = mgr.start(
             input_id=int(payload.get("input_id")),
@@ -42,16 +44,24 @@ def api_rt_start(request: HttpRequest):
         )
         return JsonResponse(res)
     except Exception as e:
+        mgr = RTSessionManager.instance()
+        mgr.stop()
         return JsonResponse({"running": False, "error": str(e)}, status=400)
 
 
 @csrf_exempt
 def api_rt_stop(request: HttpRequest):
-    mgr = RTSessionManager.instance()
-    res = mgr.stop()
-    return JsonResponse(res)
+    try:
+        mgr = RTSessionManager.instance()
+        res = mgr.stop()
+        return JsonResponse(res)
+    except Exception as e:
+        return JsonResponse({"running": False, "error": str(e)}, status=500)
 
 
 def api_rt_status(request: HttpRequest):
-    mgr = RTSessionManager.instance()
-    return JsonResponse(mgr.status())
+    try:
+        mgr = RTSessionManager.instance()
+        return JsonResponse(mgr.status())
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)

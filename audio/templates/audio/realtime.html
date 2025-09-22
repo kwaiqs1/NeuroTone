@@ -32,8 +32,9 @@
     .h1 { font-size:28px; font-weight:800; letter-spacing:.2px; margin-bottom:8px; }
     .muted { color: var(--muted); }
     .range { width:100%; }
-    .badge { background:#0f1528; color:#cfe1ff; border:1px solid #1e2a4a; padding:4px 8px; border-radius:999px; font-size:12px; }
     .footer { margin-top:22px; font-size:12px; color:#8fa6d8; }
+    .alert { margin-top:12px; background:#2a1020; border:1px solid #5b163e; color:#ffd6e5; padding:10px 12px; border-radius:10px; display:none; }
+    .alert.on { display:block; }
   </style>
 </head>
 <body>
@@ -101,6 +102,8 @@
       <div class="status"><span id="dot" class="status-dot"></span><span id="stxt">stopped</span></div>
     </div>
 
+    <div id="errBox" class="alert"></div>
+
     <div class="kpis">
       <div class="k"><b>Frames</b><span id="k_frames">0</span></div>
       <div class="k"><b>Samplerate</b><span id="k_sr">—</span></div>
@@ -114,35 +117,55 @@
 
 <script>
   const el = id => document.getElementById(id);
-
   function fmt(v, d=2){ return Number(v).toFixed(d); }
+  function showErr(msg){
+    const b = el('errBox');
+    if(msg){ b.textContent = 'Ошибка: ' + msg; b.classList.add('on'); }
+    else { b.textContent = ''; b.classList.remove('on'); }
+  }
 
   async function api(path, opts={}){
     const r = await fetch(path, Object.assign({
       headers: {'Content-Type':'application/json'},
       credentials:'same-origin'
     }, opts));
-    return await r.json();
+    let data = null;
+    try { data = await r.json(); } catch(e) {
+      throw new Error('Некорректный ответ сервера ('+r.status+')');
+    }
+    if(!r.ok){
+      const msg = (data && (data.error || data.detail)) ? (data.error || data.detail) : ('HTTP '+r.status);
+      throw new Error(msg);
+    }
+    return data;
   }
 
   async function loadDevices(){
-    const data = await api('/rt/api/devices/');
-    const inSel = el('inDev'), outSel = el('outDev');
-    inSel.innerHTML = ''; outSel.innerHTML = '';
-    data.devices.forEach(d=>{
-      const iopt = document.createElement('option');
-      iopt.value = d.id; iopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (in:${d.max_input_channels})`;
-      if(d.id === data.default_input) iopt.selected = true;
-      if(d.max_input_channels>0) inSel.appendChild(iopt);
-
-      const oopt = document.createElement('option');
-      oopt.value = d.id; oopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (out:${d.max_output_channels})`;
-      if(d.id === data.default_output) oopt.selected = true;
-      if(d.max_output_channels>0) outSel.appendChild(oopt);
-    });
+    try{
+      const data = await api('/rt/api/devices/');
+      const inSel = el('inDev'), outSel = el('outDev');
+      inSel.innerHTML = ''; outSel.innerHTML = '';
+      data.devices.forEach(d=>{
+        if(d.max_input_channels>0){
+          const iopt = document.createElement('option');
+          iopt.value = d.id; iopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (in:${d.max_input_channels})`;
+          if(d.id === data.default_input) iopt.selected = true;
+          inSel.appendChild(iopt);
+        }
+        if(d.max_output_channels>0){
+          const oopt = document.createElement('option');
+          oopt.value = d.id; oopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (out:${d.max_output_channels})`;
+          if(d.id === data.default_output) oopt.selected = true;
+          outSel.appendChild(oopt);
+        }
+      });
+    }catch(e){
+      showErr(e.message);
+    }
   }
 
   async function startRT(){
+    showErr('');
     const payload = {
       input_id: Number(el('inDev').value),
       output_id: Number(el('outDev').value),
@@ -157,16 +180,24 @@
     const sr = Number(el('sr').value);
     if(sr > 0) payload.samplerate = sr;
 
-    const res = await api('/rt/api/start/', {method:'POST', body: JSON.stringify(payload)});
-    if(res.error){
-      alert('Ошибка запуска: ' + res.error);
+    try{
+      const res = await api('/rt/api/start/', {method:'POST', body: JSON.stringify(payload)});
+      updateStatus(res);
+    }catch(e){
+      showErr(e.message);
+      // запрашиваем статус, вдруг что-то успело запуститься
+      try{ updateStatus(await api('/rt/api/status/')); }catch(_){}
     }
-    updateStatus(res);
   }
 
   async function stopRT(){
-    const res = await api('/rt/api/stop/', {method:'POST', body: '{}'});
-    updateStatus(res);
+    showErr('');
+    try{
+      const res = await api('/rt/api/stop/', {method:'POST', body: '{}'});
+      updateStatus(res);
+    }catch(e){
+      showErr(e.message);
+    }
   }
 
   function updateStatus(s){
@@ -175,16 +206,17 @@
     el('stxt').textContent = on ? 'running' : 'stopped';
     el('k_frames').textContent = s.frames ?? 0;
     if(s.params){
-      el('k_sr').textContent = s.params.samplerate;
-      el('k_ch').textContent = s.params.channels;
-      el('k_block').textContent = s.params.block;
+      el('k_sr').textContent = s.params.samplerate ?? '—';
+      el('k_ch').textContent = s.params.channels ?? '—';
+      el('k_block').textContent = s.params.block ?? '—';
     } else {
       el('k_sr').textContent = '—';
       el('k_ch').textContent = '—';
       el('k_block').textContent = '—';
     }
     if(s.last_error){
-      console.warn('RT error:', s.last_error);
+      showErr(s.last_error);
+      console.warn('RT last_error:', s.last_error);
     }
   }
 
@@ -192,7 +224,9 @@
     try {
       const s = await api('/rt/api/status/');
       updateStatus(s);
-    } catch(e) {}
+    } catch(e) {
+      // молча, чтобы не спамить
+    }
     setTimeout(poll, 1000);
   }
 

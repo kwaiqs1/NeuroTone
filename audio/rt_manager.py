@@ -1,10 +1,10 @@
 # audio/rt_manager.py
 # Управление одной real-time сессией (start/stop/status) в фоне.
-# Использует RealTimeProcessor из audio.realtime и sounddevice Stream (duplex).
+# Надёжный автоподбор samplerate/каналов и явная передача ошибок в UI.
 
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -13,7 +13,6 @@ from .realtime import RealTimeProcessor, RTConfig
 
 
 class RTSessionManager:
-    """Singleton-менеджер одной RT-сессии."""
     _instance = None
     _lock = threading.Lock()
 
@@ -33,7 +32,7 @@ class RTSessionManager:
                 cls._instance = RTSessionManager()
         return cls._instance
 
-    # ---------- Devices ----------
+    # ---------- список устройств ----------
     @staticmethod
     def list_devices() -> Dict[str, Any]:
         devs = sd.query_devices()
@@ -56,7 +55,47 @@ class RTSessionManager:
             })
         return {"devices": out, "default_input": sd.default.device[0], "default_output": sd.default.device[1]}
 
-    # ---------- Start/Stop ----------
+    # ---------- внутренний автоподбор ----------
+    def _pick_sr_and_channels(self, input_id: int, output_id: int, samplerate: Optional[int]) -> Tuple[int, int]:
+        indev = sd.query_devices(input_id)
+        outdev = sd.query_devices(output_id)
+        in_max = int(indev.get("max_input_channels", 0))
+        out_max = int(outdev.get("max_output_channels", 0))
+
+        cand_channels = []
+        if in_max >= 1 and out_max >= 1:
+            cand_channels.append(1)
+        if in_max >= 2 and out_max >= 2:
+            cand_channels.append(2)
+
+        if not cand_channels:
+            raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
+
+        # кандидаты по samplerate
+        sr_candidates = []
+        if samplerate:
+            sr_candidates.append(int(samplerate))
+        # пробуем дефолт девайса, затем популярные
+        for cand in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
+            if cand and int(cand) not in sr_candidates:
+                sr_candidates.append(int(cand))
+
+        # подбираем рабочую пару (коротко открываем/закрываем Stream)
+        last_err = None
+        for ch in cand_channels:
+            for sr in sr_candidates:
+                try:
+                    test = sd.Stream(device=(input_id, output_id),
+                                     channels=ch, samplerate=int(sr),
+                                     dtype="float32", blocksize=256)
+                    test.close()
+                    return int(sr), int(ch)
+                except Exception as e:
+                    last_err = e
+                    continue
+        raise RuntimeError(f"Не удалось подобрать рабочую частоту дискретизации/каналы: {last_err}")
+
+    # ---------- запуск/останов ----------
     def start(self,
               input_id: int,
               output_id: int,
@@ -69,34 +108,10 @@ class RTSessionManager:
               ultra_anc: bool = True,
               samplerate: Optional[int] = None) -> Dict[str, Any]:
 
-        self.stop()  # Остановим, если что-то уже работало
+        self.stop()  # если что-то запущено — останавливаем
 
-        # Подбор каналов: пробуем mono (1), иначе 2
-        indev = sd.query_devices(input_id)
-        outdev = sd.query_devices(output_id)
-        in_max = int(indev.get("max_input_channels", 0))
-        out_max = int(outdev.get("max_output_channels", 0))
-
-        if in_max >= 1 and out_max >= 1:
-            channels = 1
-        elif in_max >= 2 and out_max >= 2:
-            channels = 2
-        else:
-            raise RuntimeError("Выбранные устройства не совместимы по числу каналов.")
-
-        # Частота дискретизации
-        sr = int(samplerate or (outdev.get("default_samplerate") or 48000))
-        # Если устройство не тянет sr — попробуем fallback на 48000 → 44100
-        for try_sr in [sr, 48000, 44100]:
-            try:
-                sd.check_input_settings(device=input_id, channels=channels, samplerate=try_sr)
-                sd.check_output_settings(device=output_id, channels=channels, samplerate=try_sr)
-                sr = try_sr
-                break
-            except Exception:
-                sr = None
-        if sr is None:
-            raise RuntimeError("Не удалось подобрать допустимую частоту дискретизации для пары устройств.")
+        # подбираем sr/каналы
+        sr, channels = self._pick_sr_and_channels(input_id, output_id, samplerate)
 
         cfg = RTConfig(
             trigger_sensitivity=sensitivity,
@@ -124,16 +139,17 @@ class RTSessionManager:
             try:
                 if status:
                     self._status["callback_status"] = str(status)
-                # Вход → mono
+
+                # моно на вход (если стерео — микс в моно)
                 if self._params["channels"] == 2 and indata.shape[1] >= 2:
                     x = indata[:, :2].mean(axis=1).astype(np.float32)
                 else:
                     x = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
 
                 y = proc.process_block(x)
-                # Выравниваем длину под frames
+
+                # выравниваем длину под frames
                 if len(y) < frames:
-                    # паддинг нулями (задержка на старте)
                     buf = np.zeros(frames, dtype=np.float32)
                     buf[:len(y)] = y
                     y = buf
@@ -159,11 +175,8 @@ class RTSessionManager:
                     blocksize=self._params["block"],
                     dtype="float32",
                     channels=self._params["channels"],
-                    callback=_cb,
-                    latency="low",
-                    clip_off=True,
-                    dither_off=True,
-                    never_drop_input=True,
+                    callback=_cb
+                    # убрали спорные флаги на Windows: latency/clip_off/dither_off/never_drop_input
                 ) as st:
                     self._stream = st
                     while self._running:
