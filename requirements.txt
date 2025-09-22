@@ -11,3 +11,9 @@ tflite-support==0.4.3
 noisereduce==3.0.0
 webrtcvad==2.0.10
 sounddevice==0.4.6
+torch
+torchaudio
+torchvision
+panns-inference==0.1.0
+sounddevice==0.4.6
+webrtcvad-wheels
