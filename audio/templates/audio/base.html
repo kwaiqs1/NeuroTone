@@ -1,21 +1,26 @@
 <!doctype html>
-<html lang="en">
+{% load static %}
+<html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CalmCity MVP</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-<link href="/static/audio/styles.css" rel="stylesheet">
+  <meta charset="utf-8" />
+  <title>{% block title %}NeuroTone{% endblock %}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="{% static 'audio/styles.css' %}">
+  <style>
+    .nav { display:flex; gap:12px; align-items:center; padding:12px 16px; background:#0b1020; border-bottom:1px solid #1e2a4a; }
+    .nav a { color:#cfe1ff; text-decoration:none; padding:8px 12px; border-radius:10px; background:#142042; }
+    .nav a:hover { background:#1b284a; }
+    .brand { font-weight:800; color:#fff; letter-spacing:.3px; margin-right:auto; }
+  </style>
 </head>
 <body>
-<nav class="navbar navbar-dark bg-dark mb-4">
-<div class="container-fluid">
-<a class="navbar-brand" href="/">CalmCity — Comfort Audio</a>
-</div>
-</nav>
-<div class="container">
-{% block content %}{% endblock %}
-</div>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <div class="nav">
+    <div class="brand">NeuroTone</div>
+    <a href="/">Файлы</a>
+    <a href="/rt/">Real-Time</a>
+  </div>
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
 </body>
 </html>
