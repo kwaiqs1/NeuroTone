@@ -1,5 +1,7 @@
 # audio/rt_manager.py
-# Надёжный запуск real-time аудио под Windows: строго WASAPI shared + совместимость как в CLI.
+# Надёжный запуск real-time аудио под Windows:
+# WASAPI shared, перебор форматов, совместимость как в CLI,
+# и безопасный внутренний blocksize для DSP (без деления на ноль).
 
 import threading
 import time
@@ -78,7 +80,7 @@ class RTSessionManager:
         return s
 
     def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
-        # Приоритет — полностью совместимый моно/моно, как в CLI
+        # приоритет — максимально совместимый моно/моно (как в CLI), затем мионо→стерео и т.д.
         pairs: List[Tuple[int, int]] = []
         if in_max >= 1 and out_max >= 1:
             pairs.append((1, 1))
@@ -88,8 +90,7 @@ class RTSessionManager:
             pairs.append((2, 2))
         if in_max >= 2 and out_max >= 1:
             pairs.append((2, 1))
-        # Уникализируем
-        seen = set(); out = []
+        seen = set(); out: List[Tuple[int, int]] = []
         for p in pairs:
             if p not in seen:
                 out.append(p); seen.add(p)
@@ -104,7 +105,7 @@ class RTSessionManager:
         want_block: int,
         user_sr: Optional[int]
     ) -> Tuple[int, Tuple[int, int], int, Tuple[str, str], Optional[tuple]]:
-
+        """Подбираем (sr, (in_ch,out_ch), block, (in_dtype,out_dtype), extra_settings)."""
         indev = sd.query_devices(input_id)
         outdev = sd.query_devices(output_id)
 
@@ -113,7 +114,7 @@ class RTSessionManager:
             int(outdev.get("max_output_channels", 0)),
         )
         sr_list = self._candidate_samplerates(indev, outdev, user_sr)
-        # 0 первым — пусть система выберет безопасный размер, затем наши попытки
+        # 0 первым — безопасно для драйвера (ОС выберет размер)
         blocks = [0, int(want_block), 960, 1024, 2048, 512, 256]
         dtype_pairs = [("float32", "float32"), ("int16", "int16")]
 
@@ -152,12 +153,11 @@ class RTSessionManager:
                                 last_err = e
                                 continue
 
-        # --- Совместимость как в CLI: channels=1, float32, blocksize=0, без extra_settings
+        # --- Резерв: как в CLI (channels=1, float32, blocksize=0, без extra_settings)
         try:
             def _cb_compat(indata, outdata, frames, t, status):
                 if outdata is not None:
                     outdata[:] = 0
-            # берем либо user_sr, либо дефолт выхода, либо 48000
             sr_cli = int(user_sr or outdev.get("default_samplerate") or 48000)
             test = sd.Stream(device=(input_id, output_id),
                              samplerate=sr_cli, blocksize=0,
@@ -190,6 +190,12 @@ class RTSessionManager:
             want_block=block, user_sr=samplerate
         )
 
+        # === ВАЖНО: внутренний размер блока для DSP (исправление "float division by zero") ===
+        # Если драйвер оставил blocksize=0, берём безопасный внутренний размер ~20 мс.
+        proc_block = int(sr * 0.02) if bs == 0 else int(bs)
+        if proc_block < 240:  # не даём слишком маленький блок
+            proc_block = 240
+
         cfg = RTConfig(
             trigger_sensitivity=sensitivity,
             vacuum_strength=vacuum,
@@ -203,6 +209,7 @@ class RTSessionManager:
         self._params = {
             "input_id": input_id, "output_id": output_id,
             "samplerate": sr, "block": bs,
+            "proc_block": proc_block,
             "in_channels": in_ch, "out_channels": out_ch,
             "in_dtype": dt_in, "out_dtype": dt_out,
             "cfg": cfg.__dict__,
@@ -211,7 +218,7 @@ class RTSessionManager:
             "extra_mode": ("wasapi-shared" if extra else "none"),
         }
 
-        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=bs)
+        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=proc_block)
         self._proc = proc
         self._running = True
         self._last_error = None
@@ -230,7 +237,7 @@ class RTSessionManager:
 
                 y = proc.process_block(x)
 
-                # подгоняем длину
+                # выравниваем длину
                 if len(y) < frames:
                     buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
                 elif len(y) > frames:
@@ -252,7 +259,7 @@ class RTSessionManager:
                 kwargs = dict(
                     device=(input_id, output_id),
                     samplerate=sr,
-                    blocksize=bs,
+                    blocksize=bs,  # для драйвера можно оставить 0 — это ок
                     channels=(in_ch, out_ch),
                     dtype=(dt_in, dt_out),
                     callback=_cb,
