@@ -1,10 +1,9 @@
 # audio/rt_manager.py
-# Управление одной real-time сессией (start/stop/status) в фоне.
-# Надёжный автоподбор samplerate/каналов и явная передача ошибок в UI.
+# Управление real-time сессией. Надёжное открытие Stream под Windows (WASAPI/WDM-KS).
 
 import threading
 import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 import sounddevice as sd
@@ -37,6 +36,7 @@ class RTSessionManager:
     def list_devices() -> Dict[str, Any]:
         devs = sd.query_devices()
         hostapis = sd.query_hostapis()
+
         def host_name(idx):
             try:
                 return hostapis[idx]["name"]
@@ -55,47 +55,114 @@ class RTSessionManager:
             })
         return {"devices": out, "default_input": sd.default.device[0], "default_output": sd.default.device[1]}
 
-    # ---------- внутренний автоподбор ----------
-    def _pick_sr_and_channels(self, input_id: int, output_id: int, samplerate: Optional[int]) -> Tuple[int, int]:
+    # ---------- helpers ----------
+    @staticmethod
+    def _host_name_of(device_id: int) -> str:
+        d = sd.query_devices(device_id)
+        api_idx = d.get("hostapi", 0)
+        return sd.query_hostapis()[api_idx].get("name", "Unknown")
+
+    @staticmethod
+    def _mk_extra_settings(device_id: int, exclusive: bool):
+        """Создаёт extra_settings для конкретного device, если он WASAPI."""
+        name = RTSessionManager._host_name_of(device_id).lower()
+        if "wasapi" in name:
+            # Shared mode чаще всего безопаснее. Эксклюзив попробуем на крайний случай.
+            return sd.WasapiSettings(exclusive=bool(exclusive))
+        return None
+
+    def _candidate_channels(self, in_max: int, out_max: int) -> List[int]:
+        cand = []
+        if in_max >= 1 and out_max >= 1:
+            cand.append(1)
+        if in_max >= 2 and out_max >= 2:
+            cand.append(2)
+        return cand
+
+    def _candidate_samplerates(self, indev, outdev, user_sr: Optional[int]) -> List[int]:
+        s = []
+        if user_sr:
+            s.append(int(user_sr))
+        for v in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
+            if v and int(v) not in s:
+                s.append(int(v))
+        return s
+
+    def _pick_working_combo(
+        self,
+        input_id: int,
+        output_id: int,
+        want_block: int,
+        user_sr: Optional[int]
+    ) -> Tuple[int, int, int, Optional[tuple]]:
+        """
+        Подбираем (sr, channels, block, extra_settings_tuple) с коротким тестовым открытием Stream
+        с callback — чтобы словить те же ошибки, что и при реальном запуске.
+        """
         indev = sd.query_devices(input_id)
         outdev = sd.query_devices(output_id)
+
         in_max = int(indev.get("max_input_channels", 0))
         out_max = int(outdev.get("max_output_channels", 0))
-
-        cand_channels = []
-        if in_max >= 1 and out_max >= 1:
-            cand_channels.append(1)
-        if in_max >= 2 and out_max >= 2:
-            cand_channels.append(2)
-
-        if not cand_channels:
+        ch_list = self._candidate_channels(in_max, out_max)
+        if not ch_list:
             raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
 
-        # кандидаты по samplerate
-        sr_candidates = []
-        if samplerate:
-            sr_candidates.append(int(samplerate))
-        # пробуем дефолт девайса, затем популярные
-        for cand in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
-            if cand and int(cand) not in sr_candidates:
-                sr_candidates.append(int(cand))
+        sr_list = self._candidate_samplerates(indev, outdev, user_sr)
+        blocks = [int(want_block), 960, 1024, 2048, 512, 256]
 
-        # подбираем рабочую пару (коротко открываем/закрываем Stream)
+        # Комбинации extra_settings: WASAPI shared → WASAPI exclusive → без extra_settings
+        in_api = self._host_name_of(input_id).lower()
+        out_api = self._host_name_of(output_id).lower()
+
+        extra_variants = []
+        if "wasapi" in in_api or "wasapi" in out_api:
+            # shared
+            extra_variants.append((
+                self._mk_extra_settings(input_id, exclusive=False),
+                self._mk_extra_settings(output_id, exclusive=False)
+            ))
+            # exclusive
+            extra_variants.append((
+                self._mk_extra_settings(input_id, exclusive=True),
+                self._mk_extra_settings(output_id, exclusive=True)
+            ))
+        # без специальных настроек
+        extra_variants.append((None, None))
+
         last_err = None
-        for ch in cand_channels:
-            for sr in sr_candidates:
-                try:
-                    test = sd.Stream(device=(input_id, output_id),
-                                     channels=ch, samplerate=int(sr),
-                                     dtype="float32", blocksize=256)
-                    test.close()
-                    return int(sr), int(ch)
-                except Exception as e:
-                    last_err = e
-                    continue
-        raise RuntimeError(f"Не удалось подобрать рабочую частоту дискретизации/каналы: {last_err}")
 
-    # ---------- запуск/останов ----------
+        def _dummy_cb(indata, outdata, frames, t, status):
+            # просто молчим, но прогоняем через callback-путь
+            if outdata is not None:
+                outdata[:] = 0
+
+        for ch in ch_list:
+            for sr in sr_list:
+                for bs in blocks:
+                    for ex_in, ex_out in extra_variants:
+                        kwargs = dict(
+                            device=(input_id, output_id),
+                            channels=ch,
+                            samplerate=int(sr),
+                            dtype="float32",
+                            blocksize=int(bs),
+                            callback=_dummy_cb,
+                        )
+                        # подаём extra_settings только если хоть одно не None
+                        if ex_in is not None or ex_out is not None:
+                            kwargs["extra_settings"] = (ex_in, ex_out)
+                        try:
+                            test = sd.Stream(**kwargs)
+                            test.close()
+                            return int(sr), int(ch), int(bs), ((ex_in, ex_out) if (ex_in or ex_out) else None)
+                        except Exception as e:
+                            last_err = e
+                            continue
+
+        raise RuntimeError(f"Не удалось открыть аудиопоток: {last_err}")
+
+    # ---------- управление ----------
     def start(self,
               input_id: int,
               output_id: int,
@@ -108,10 +175,15 @@ class RTSessionManager:
               ultra_anc: bool = True,
               samplerate: Optional[int] = None) -> Dict[str, Any]:
 
-        self.stop()  # если что-то запущено — останавливаем
+        self.stop()  # закрыть предыдущую сессию, если была
 
-        # подбираем sr/каналы
-        sr, channels = self._pick_sr_and_channels(input_id, output_id, samplerate)
+        # Находим работающую связку:
+        sr, channels, bs, extra = self._pick_working_combo(
+            input_id=input_id,
+            output_id=output_id,
+            want_block=block,
+            user_sr=samplerate
+        )
 
         cfg = RTConfig(
             trigger_sensitivity=sensitivity,
@@ -125,11 +197,14 @@ class RTSessionManager:
 
         self._params = {
             "input_id": input_id, "output_id": output_id,
-            "channels": channels, "samplerate": sr, "block": int(block),
+            "channels": channels, "samplerate": sr, "block": bs,
             "cfg": cfg.__dict__,
+            "hostapi_in": self._host_name_of(input_id),
+            "hostapi_out": self._host_name_of(output_id),
+            "extra_mode": ("wasapi" if extra else "none")
         }
 
-        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=int(block))
+        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=bs)
         self._proc = proc
         self._running = True
         self._last_error = None
@@ -140,25 +215,22 @@ class RTSessionManager:
                 if status:
                     self._status["callback_status"] = str(status)
 
-                # моно на вход (если стерео — микс в моно)
-                if self._params["channels"] == 2 and indata.shape[1] >= 2:
+                # вход → моно
+                if channels == 2 and indata.shape[1] >= 2:
                     x = indata[:, :2].mean(axis=1).astype(np.float32)
                 else:
                     x = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
 
                 y = proc.process_block(x)
 
-                # выравниваем длину под frames
+                # выравниваем длину
                 if len(y) < frames:
-                    buf = np.zeros(frames, dtype=np.float32)
-                    buf[:len(y)] = y
-                    y = buf
+                    buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
                 elif len(y) > frames:
                     y = y[-frames:]
 
-                if self._params["channels"] == 2 and outdata.shape[1] >= 2:
-                    outdata[:, 0] = y
-                    outdata[:, 1] = y
+                if channels == 2 and outdata.shape[1] >= 2:
+                    outdata[:, 0] = y; outdata[:, 1] = y
                 else:
                     outdata[:, 0] = y
 
@@ -169,15 +241,18 @@ class RTSessionManager:
 
         def _run():
             try:
-                with sd.Stream(
+                kwargs = dict(
                     device=(input_id, output_id),
-                    samplerate=self._params["samplerate"],
-                    blocksize=self._params["block"],
+                    samplerate=sr,
+                    blocksize=bs,
                     dtype="float32",
-                    channels=self._params["channels"],
-                    callback=_cb
-                    # убрали спорные флаги на Windows: latency/clip_off/dither_off/never_drop_input
-                ) as st:
+                    channels=channels,
+                    callback=_cb,
+                )
+                if extra:
+                    kwargs["extra_settings"] = extra
+                # Открываем реальный поток
+                with sd.Stream(**kwargs) as st:
                     self._stream = st
                     while self._running:
                         time.sleep(0.1)
@@ -196,8 +271,7 @@ class RTSessionManager:
         self._running = False
         if self._stream is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                self._stream.stop(); self._stream.close()
             except Exception:
                 pass
             self._stream = None
