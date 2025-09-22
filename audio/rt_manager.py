@@ -1,6 +1,5 @@
 # audio/rt_manager.py
-# Надёжный запуск real-time под Windows/WASAPI:
-# перебор samplerate, (in_ch,out_ch), blocksize, (in_dtype,out_dtype), shared/exclusive.
+# Надёжный запуск real-time аудио под Windows: строго WASAPI shared + совместимость как в CLI.
 
 import threading
 import time
@@ -59,19 +58,18 @@ class RTSessionManager:
     # ---------- helpers ----------
     @staticmethod
     def _host_name_of(device_id: int) -> str:
-        d = sd.query_devices(device_id)
-        api_idx = d.get("hostapi", 0)
+        api_idx = sd.query_devices(device_id).get("hostapi", 0)
         return sd.query_hostapis()[api_idx].get("name", "Unknown")
 
     @staticmethod
-    def _mk_extra_settings(device_id: int, exclusive: bool):
+    def _mk_wasapi_shared(device_id: int):
         name = RTSessionManager._host_name_of(device_id).lower()
         if "wasapi" in name:
-            return sd.WasapiSettings(exclusive=bool(exclusive))
+            return sd.WasapiSettings(exclusive=False)  # только shared
         return None
 
     def _candidate_samplerates(self, indev, outdev, user_sr: Optional[int]) -> List[int]:
-        s = []
+        s: List[int] = []
         if user_sr:
             s.append(int(user_sr))
         for v in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
@@ -80,17 +78,17 @@ class RTSessionManager:
         return s
 
     def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
+        # Приоритет — полностью совместимый моно/моно, как в CLI
         pairs: List[Tuple[int, int]] = []
-        # приоритетные пары
-        if in_max >= 1 and out_max >= 2:
-            pairs.append((1, 2))  # микрофон моно, наушники стерео
-        if in_max >= 2 and out_max >= 2:
-            pairs.append((2, 2))
         if in_max >= 1 and out_max >= 1:
             pairs.append((1, 1))
+        if in_max >= 1 and out_max >= 2:
+            pairs.append((1, 2))
+        if in_max >= 2 and out_max >= 2:
+            pairs.append((2, 2))
         if in_max >= 2 and out_max >= 1:
             pairs.append((2, 1))
-        # уникализируем порядок
+        # Уникализируем
         seen = set(); out = []
         for p in pairs:
             if p not in seen:
@@ -106,38 +104,23 @@ class RTSessionManager:
         want_block: int,
         user_sr: Optional[int]
     ) -> Tuple[int, Tuple[int, int], int, Tuple[str, str], Optional[tuple]]:
-        """
-        Подбираем (sr, (in_ch,out_ch), block, (in_dtype,out_dtype), extra_settings_tuple)
-        и проверяем открытие короткого Stream с callback.
-        """
+
         indev = sd.query_devices(input_id)
         outdev = sd.query_devices(output_id)
 
-        in_max = int(indev.get("max_input_channels", 0))
-        out_max = int(outdev.get("max_output_channels", 0))
-
-        ch_pairs = self._candidate_channel_pairs(in_max, out_max)
+        ch_pairs = self._candidate_channel_pairs(
+            int(indev.get("max_input_channels", 0)),
+            int(outdev.get("max_output_channels", 0)),
+        )
         sr_list = self._candidate_samplerates(indev, outdev, user_sr)
-        blocks = [int(want_block), 960, 1024, 2048, 512, 256]
-        dtype_pairs = [("float32", "float32"), ("int16", "int16")]  # симметричный dtype
+        # 0 первым — пусть система выберет безопасный размер, затем наши попытки
+        blocks = [0, int(want_block), 960, 1024, 2048, 512, 256]
+        dtype_pairs = [("float32", "float32"), ("int16", "int16")]
 
-        in_api = self._host_name_of(input_id).lower()
-        out_api = self._host_name_of(output_id).lower()
-
-        extra_variants = []
-        if "wasapi" in in_api or "wasapi" in out_api:
-            # WASAPI shared
-            extra_variants.append((
-                self._mk_extra_settings(input_id, exclusive=False),
-                self._mk_extra_settings(output_id, exclusive=False)
-            ))
-            # WASAPI exclusive
-            extra_variants.append((
-                self._mk_extra_settings(input_id, exclusive=True),
-                self._mk_extra_settings(output_id, exclusive=True)
-            ))
-        # без спец-настроек
-        extra_variants.append((None, None))
+        # Только WASAPI shared (если доступен), иначе без extra_settings
+        ex_in = self._mk_wasapi_shared(input_id)
+        ex_out = self._mk_wasapi_shared(output_id)
+        extra_variants = [((ex_in, ex_out) if (ex_in or ex_out) else (None, None))]
 
         last_err = None
 
@@ -149,7 +132,7 @@ class RTSessionManager:
             for sr in sr_list:
                 for bs in blocks:
                     for (dt_in, dt_out) in dtype_pairs:
-                        for ex_in, ex_out in extra_variants:
+                        for ex_in_v, ex_out_v in extra_variants:
                             kwargs = dict(
                                 device=(input_id, output_id),
                                 samplerate=int(sr),
@@ -158,16 +141,32 @@ class RTSessionManager:
                                 channels=(int(in_ch), int(out_ch)),
                                 dtype=(dt_in, dt_out),
                             )
-                            if ex_in is not None or ex_out is not None:
-                                kwargs["extra_settings"] = (ex_in, ex_out)
+                            if ex_in_v is not None or ex_out_v is not None:
+                                kwargs["extra_settings"] = (ex_in_v, ex_out_v)
                             try:
                                 test = sd.Stream(**kwargs)
                                 test.close()
                                 return (int(sr), (int(in_ch), int(out_ch)), int(bs), (dt_in, dt_out),
-                                        ((ex_in, ex_out) if (ex_in or ex_out) else None))
+                                        ((ex_in_v, ex_out_v) if (ex_in_v or ex_out_v) else None))
                             except Exception as e:
                                 last_err = e
                                 continue
+
+        # --- Совместимость как в CLI: channels=1, float32, blocksize=0, без extra_settings
+        try:
+            def _cb_compat(indata, outdata, frames, t, status):
+                if outdata is not None:
+                    outdata[:] = 0
+            # берем либо user_sr, либо дефолт выхода, либо 48000
+            sr_cli = int(user_sr or outdev.get("default_samplerate") or 48000)
+            test = sd.Stream(device=(input_id, output_id),
+                             samplerate=sr_cli, blocksize=0,
+                             channels=1, dtype="float32",
+                             callback=_cb_compat)
+            test.close()
+            return sr_cli, (1, 1), 0, ("float32", "float32"), None
+        except Exception as e:
+            last_err = e
 
         raise RuntimeError(f"Не удалось открыть аудиопоток: {last_err}")
 
@@ -209,7 +208,7 @@ class RTSessionManager:
             "cfg": cfg.__dict__,
             "hostapi_in": self._host_name_of(input_id),
             "hostapi_out": self._host_name_of(output_id),
-            "extra_mode": ("wasapi" if extra else "none")
+            "extra_mode": ("wasapi-shared" if extra else "none"),
         }
 
         proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=bs)
@@ -223,7 +222,7 @@ class RTSessionManager:
                 if status:
                     self._status["callback_status"] = str(status)
 
-                # вход → моно для обработки
+                # вход -> моно на обработку
                 if indata.ndim == 2 and indata.shape[1] > 1:
                     x = indata[:, :2].mean(axis=1).astype(np.float32)
                 else:
@@ -231,7 +230,7 @@ class RTSessionManager:
 
                 y = proc.process_block(x)
 
-                # выравниваем длину
+                # подгоняем длину
                 if len(y) < frames:
                     buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
                 elif len(y) > frames:
@@ -259,7 +258,7 @@ class RTSessionManager:
                     callback=_cb,
                 )
                 if extra:
-                    kwargs["extra_settings"] = extra
+                    kwargs["extra_settings"] = extra  # только wasapi-shared
                 with sd.Stream(**kwargs) as st:
                     self._stream = st
                     while self._running:
