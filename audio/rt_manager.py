@@ -1,6 +1,6 @@
 # audio/rt_manager.py
-# Надёжный запуск real-time потока под Windows/WASAPI:
-# перебор samplerate/channels/blocksize + dtype(float32/int16) + shared/exclusive.
+# Надёжный запуск real-time под Windows/WASAPI:
+# перебор samplerate, (in_ch,out_ch), blocksize, (in_dtype,out_dtype), shared/exclusive.
 
 import threading
 import time
@@ -70,15 +70,6 @@ class RTSessionManager:
             return sd.WasapiSettings(exclusive=bool(exclusive))
         return None
 
-    def _candidate_channels(self, in_max: int, out_max: int) -> List[int]:
-        # приоритет stereo → mono
-        cand = []
-        if in_max >= 2 and out_max >= 2:
-            cand.append(2)
-        if in_max >= 1 and out_max >= 1:
-            cand.append(1)
-        return cand
-
     def _candidate_samplerates(self, indev, outdev, user_sr: Optional[int]) -> List[int]:
         s = []
         if user_sr:
@@ -88,46 +79,65 @@ class RTSessionManager:
                 s.append(int(v))
         return s
 
+    def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
+        pairs: List[Tuple[int, int]] = []
+        # приоритетные пары
+        if in_max >= 1 and out_max >= 2:
+            pairs.append((1, 2))  # микрофон моно, наушники стерео
+        if in_max >= 2 and out_max >= 2:
+            pairs.append((2, 2))
+        if in_max >= 1 and out_max >= 1:
+            pairs.append((1, 1))
+        if in_max >= 2 and out_max >= 1:
+            pairs.append((2, 1))
+        # уникализируем порядок
+        seen = set(); out = []
+        for p in pairs:
+            if p not in seen:
+                out.append(p); seen.add(p)
+        if not out:
+            raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
+        return out
+
     def _pick_working_combo(
         self,
         input_id: int,
         output_id: int,
         want_block: int,
         user_sr: Optional[int]
-    ) -> Tuple[int, int, int, str, Optional[tuple]]:
+    ) -> Tuple[int, Tuple[int, int], int, Tuple[str, str], Optional[tuple]]:
         """
-        Подбираем (sr, channels, block, dtype, extra_settings_tuple),
-        тестово открывая Stream с callback, чтобы поймать WASAPI-ошибки.
+        Подбираем (sr, (in_ch,out_ch), block, (in_dtype,out_dtype), extra_settings_tuple)
+        и проверяем открытие короткого Stream с callback.
         """
         indev = sd.query_devices(input_id)
         outdev = sd.query_devices(output_id)
 
         in_max = int(indev.get("max_input_channels", 0))
         out_max = int(outdev.get("max_output_channels", 0))
-        ch_list = self._candidate_channels(in_max, out_max)
-        if not ch_list:
-            raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
 
+        ch_pairs = self._candidate_channel_pairs(in_max, out_max)
         sr_list = self._candidate_samplerates(indev, outdev, user_sr)
         blocks = [int(want_block), 960, 1024, 2048, 512, 256]
-        dtypes = ["float32", "int16"]  # fallback, если формат float не поддерживается
+        dtype_pairs = [("float32", "float32"), ("int16", "int16")]  # симметричный dtype
 
         in_api = self._host_name_of(input_id).lower()
         out_api = self._host_name_of(output_id).lower()
 
         extra_variants = []
         if "wasapi" in in_api or "wasapi" in out_api:
-            # shared
+            # WASAPI shared
             extra_variants.append((
                 self._mk_extra_settings(input_id, exclusive=False),
                 self._mk_extra_settings(output_id, exclusive=False)
             ))
-            # exclusive
+            # WASAPI exclusive
             extra_variants.append((
                 self._mk_extra_settings(input_id, exclusive=True),
                 self._mk_extra_settings(output_id, exclusive=True)
             ))
-        extra_variants.append((None, None))  # без спец-настроек
+        # без спец-настроек
+        extra_variants.append((None, None))
 
         last_err = None
 
@@ -135,25 +145,26 @@ class RTSessionManager:
             if outdata is not None:
                 outdata[:] = 0
 
-        for ch in ch_list:
+        for (in_ch, out_ch) in ch_pairs:
             for sr in sr_list:
                 for bs in blocks:
-                    for dt in dtypes:
+                    for (dt_in, dt_out) in dtype_pairs:
                         for ex_in, ex_out in extra_variants:
                             kwargs = dict(
                                 device=(input_id, output_id),
-                                channels=ch,
                                 samplerate=int(sr),
-                                dtype=dt,
                                 blocksize=int(bs),
                                 callback=_dummy_cb,
+                                channels=(int(in_ch), int(out_ch)),
+                                dtype=(dt_in, dt_out),
                             )
                             if ex_in is not None or ex_out is not None:
                                 kwargs["extra_settings"] = (ex_in, ex_out)
                             try:
                                 test = sd.Stream(**kwargs)
                                 test.close()
-                                return int(sr), int(ch), int(bs), dt, ((ex_in, ex_out) if (ex_in or ex_out) else None)
+                                return (int(sr), (int(in_ch), int(out_ch)), int(bs), (dt_in, dt_out),
+                                        ((ex_in, ex_out) if (ex_in or ex_out) else None))
                             except Exception as e:
                                 last_err = e
                                 continue
@@ -175,7 +186,7 @@ class RTSessionManager:
 
         self.stop()
 
-        sr, channels, bs, dtype, extra = self._pick_working_combo(
+        sr, (in_ch, out_ch), bs, (dt_in, dt_out), extra = self._pick_working_combo(
             input_id=input_id, output_id=output_id,
             want_block=block, user_sr=samplerate
         )
@@ -192,7 +203,9 @@ class RTSessionManager:
 
         self._params = {
             "input_id": input_id, "output_id": output_id,
-            "channels": channels, "samplerate": sr, "block": bs, "dtype": dtype,
+            "samplerate": sr, "block": bs,
+            "in_channels": in_ch, "out_channels": out_ch,
+            "in_dtype": dt_in, "out_dtype": dt_out,
             "cfg": cfg.__dict__,
             "hostapi_in": self._host_name_of(input_id),
             "hostapi_out": self._host_name_of(output_id),
@@ -211,22 +224,24 @@ class RTSessionManager:
                     self._status["callback_status"] = str(status)
 
                 # вход → моно для обработки
-                if channels == 2 and indata.shape[1] >= 2:
+                if indata.ndim == 2 and indata.shape[1] > 1:
                     x = indata[:, :2].mean(axis=1).astype(np.float32)
                 else:
                     x = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
 
                 y = proc.process_block(x)
 
+                # выравниваем длину
                 if len(y) < frames:
                     buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
                 elif len(y) > frames:
                     y = y[-frames:]
 
-                if channels == 2 and outdata.shape[1] >= 2:
-                    outdata[:, 0] = y; outdata[:, 1] = y
-                else:
-                    outdata[:, 0] = y
+                if outdata is not None:
+                    if outdata.ndim == 2 and outdata.shape[1] >= 2:
+                        outdata[:, 0] = y; outdata[:, 1] = y
+                    else:
+                        outdata[:, 0] = y
 
                 self._status["frames"] = self._status.get("frames", 0) + frames
             except Exception as e:
@@ -239,8 +254,8 @@ class RTSessionManager:
                     device=(input_id, output_id),
                     samplerate=sr,
                     blocksize=bs,
-                    dtype=dtype,
-                    channels=channels,
+                    channels=(in_ch, out_ch),
+                    dtype=(dt_in, dt_out),
                     callback=_cb,
                 )
                 if extra:
