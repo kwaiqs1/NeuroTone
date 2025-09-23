@@ -1,14 +1,9 @@
 # audio/rt_manager.py
-# Надёжный запуск real-time под Windows:
-#  - сперва без extra_settings (совместимо как CLI),
-#  - затем WASAPI shared (если доступен),
-#  - при неудаче авто-переключение на DirectSound,
-#  - безопасный внутренний blocksize для DSP (без деления на 0),
-#  - финальный fallback как в CLI.
+# Менеджер реального времени: поток sounddevice + наш DSP, управление из вьюх.
 
+import json
 import threading
-import time
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Iterable, Dict, Any
 
 import numpy as np
 import sounddevice as sd
@@ -16,350 +11,147 @@ import sounddevice as sd
 from .realtime import RealTimeProcessor, RTConfig
 
 
-class RTSessionManager:
-    _instance = None
-    _lock = threading.Lock()
-
+class _RTState:
     def __init__(self):
-        self._thread: Optional[threading.Thread] = None
-        self._stream: Optional[sd.Stream] = None
-        self._running: bool = False
-        self._status: Dict[str, Any] = {"running": False}
-        self._last_error: Optional[str] = None
-        self._proc: Optional[RealTimeProcessor] = None
-        self._params: Dict[str, Any] = {}
+        self.lock = threading.Lock()
+        self.stream: Optional[sd.Stream] = None
+        self.proc: Optional[RealTimeProcessor] = None
+        self.frames = 0
+        self.samplerate = None
+        self.channels = None
+        self.block = None
+        self.running = False
 
-    @classmethod
-    def instance(cls) -> "RTSessionManager":
-        with cls._lock:
-            if cls._instance is None:
-                cls._instance = RTSessionManager()
-        return cls._instance
+state = _RTState()
 
-    # ---------- devices ----------
-    @staticmethod
-    def list_devices() -> Dict[str, Any]:
-        devs = sd.query_devices()
-        hostapis = sd.query_hostapis()
 
-        def host_name(idx):
-            try:
-                return hostapis[idx]["name"]
-            except Exception:
-                return "Unknown"
+def _make_processor(cfg_dict: Dict[str, Any], samplerate: int, blocksize: int,
+                    triggers: Optional[Iterable[str]]) -> RealTimeProcessor:
+    cfg = RTConfig(
+        trigger_sensitivity=float(cfg_dict.get("trigger_sensitivity", 0.08)),
+        vacuum_strength=float(cfg_dict.get("vacuum_strength", 1.0)),
+        protect_speech=bool(cfg_dict.get("protect_speech", True)),
+        enable_triggers=bool(cfg_dict.get("enable_triggers", True)),
+        enable_vacuum=bool(cfg_dict.get("enable_vacuum", True)),
+        enable_denoise=bool(cfg_dict.get("enable_denoise", True)),
+        ultra_anc=bool(cfg_dict.get("ultra_anc", True)),
+    )
+    return RealTimeProcessor(cfg, stream_sr=int(samplerate),
+                             blocksize=int(blocksize),
+                             selected_triggers=list(triggers) if triggers else None)
 
-        out = []
-        for i, d in enumerate(devs):
-            out.append({
-                "id": i,
-                "name": d.get("name"),
-                "hostapi": host_name(d.get("hostapi", 0)),
-                "max_input_channels": d.get("max_input_channels", 0),
-                "max_output_channels": d.get("max_output_channels", 0),
-                "default_samplerate": d.get("default_samplerate", None),
-            })
-        return {"devices": out, "default_input": sd.default.device[0], "default_output": sd.default.device[1]}
 
-    # ---------- helpers ----------
-    @staticmethod
-    def _host_name_of(device_id: int) -> str:
-        api_idx = sd.query_devices(device_id).get("hostapi", 0)
-        return sd.query_hostapis()[api_idx].get("name", "Unknown")
+def start(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    params: {
+        in_index, out_index, samplerate?, block, channels,
+        cfg: {...},
+        triggers: [label1, label2, ...]
+    }
+    """
+    with state.lock:
+        if state.stream is not None:
+            stop()
 
-    @staticmethod
-    def _is_host(device_id: int, key: str) -> bool:
-        return key.lower() in RTSessionManager._host_name_of(device_id).lower()
+        in_index = int(params["in_index"])
+        out_index = int(params["out_index"])
+        samplerate = int(params.get("samplerate") or 0) or None
+        block = int(params.get("block") or 480)
+        channels = int(params.get("channels") or 1)
+        cfg = params.get("cfg", {})
+        triggers = params.get("triggers") or []
 
-    @staticmethod
-    def _mk_wasapi_shared(device_id: int):
-        if RTSessionManager._is_host(device_id, "wasapi"):
-            return sd.WasapiSettings(exclusive=False)
-        return None
+        # если samplerate не задан — спросим у устройства
+        if samplerate is None:
+            dev = sd.query_devices(in_index)
+            samplerate = int(dev["default_samplerate"]) if dev.get("default_samplerate") else 48000
 
-    @staticmethod
-    def _find_alt_device(name_sub: str, want_output: bool, host_key: str) -> Optional[int]:
-        """Находит устройство с тем же именем (или его частью) в другом Host API, например DirectSound."""
-        name_sub = (name_sub or "").lower()
-        devs = sd.query_devices()
-        hostapis = sd.query_hostapis()
+        proc = _make_processor(cfg, samplerate, block, triggers)
 
-        def hostname(idx):
-            try:
-                return hostapis[idx]["name"].lower()
-            except Exception:
-                return ""
+        def callback(indata, outdata, frames, time, status):
+            if status:
+                # просто пишем в stderr и продолжим
+                print("SD status:", status)
+            # берём 1 канал (моно)
+            mono = indata[:, 0].copy()
+            y = proc.process_block(mono)
+            # моно → стерео при необходимости
+            if outdata.shape[1] == 1:
+                outdata[:, 0] = y
+            else:
+                outdata[:, 0] = y
+                outdata[:, 1] = y
+            state.frames += frames
 
-        best = None
-        for i, d in enumerate(devs):
-            if name_sub and name_sub not in (d.get("name") or "").lower():
-                continue
-            api = hostname(d.get("hostapi", 0))
-            if host_key.lower() not in api:
-                continue
-            max_in = int(d.get("max_input_channels", 0))
-            max_out = int(d.get("max_output_channels", 0))
-            if want_output and max_out > 0:
-                best = i; break
-            if not want_output and max_in > 0:
-                best = i; break
-        return best
-
-    def _candidate_samplerates(self, indev, outdev, user_sr: Optional[int]) -> List[int]:
-        s: List[int] = []
-        if user_sr:
-            s.append(int(user_sr))
-        for v in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
-            if v and int(v) not in s:
-                s.append(int(v))
-        return s
-
-    def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
-        pairs: List[Tuple[int, int]] = []
-        if in_max >= 1 and out_max >= 1:
-            pairs.append((1, 1))        # максимально совместимо
-        if in_max >= 1 and out_max >= 2:
-            pairs.append((1, 2))
-        if in_max >= 2 and out_max >= 2:
-            pairs.append((2, 2))
-        if in_max >= 2 and out_max >= 1:
-            pairs.append((2, 1))
-        # уникализируем
-        seen = set(); out = []
-        for p in pairs:
-            if p not in seen:
-                out.append(p); seen.add(p)
-        if not out:
-            raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
-        return out
-
-    def _attempt_open(self, input_id: int, output_id: int,
-                      ch_pairs: List[Tuple[int,int]],
-                      sr_list: List[int],
-                      want_block: int,
-                      allow_wasapi_shared: bool) -> Optional[Tuple[int, Tuple[int,int], int, Tuple[str,str], Optional[tuple]]]:
-        """Пробует открыть поток: сначала без extra_settings, затем (опц.) WASAPI shared."""
-        blocks = [0, int(want_block), 960, 1024, 2048, 512, 256]
-        dtype_pairs = [("float32", "float32"), ("int16", "int16")]
-
-        # порядок extra_settings: сначала None (как CLI), потом WASAPI shared при желании
-        extras: List[Optional[tuple]] = [None]
-        if allow_wasapi_shared:
-            ex_in = self._mk_wasapi_shared(input_id)
-            ex_out = self._mk_wasapi_shared(output_id)
-            if ex_in or ex_out:
-                extras.append((ex_in, ex_out))
-
-        def _dummy_cb(indata, outdata, frames, t, status):
-            if outdata is not None:
-                outdata[:] = 0
-
-        last_err = None
-        for (in_ch, out_ch) in ch_pairs:
-            for sr in sr_list:
-                for bs in blocks:
-                    for (dt_in, dt_out) in dtype_pairs:
-                        for ex in extras:
-                            kwargs = dict(
-                                device=(input_id, output_id),
-                                samplerate=int(sr),
-                                blocksize=int(bs),
-                                callback=_dummy_cb,
-                                channels=(int(in_ch), int(out_ch)),
-                                dtype=(dt_in, dt_out),
-                            )
-                            if ex is not None:
-                                kwargs["extra_settings"] = ex
-                            try:
-                                st = sd.Stream(**kwargs)
-                                st.close()
-                                return (int(sr), (int(in_ch), int(out_ch)), int(bs), (dt_in, dt_out), ex)
-                            except Exception as e:
-                                last_err = e
-                                continue
-        return None
-
-    def _pick_working_combo(
-        self, input_id: int, output_id: int, want_block: int, user_sr: Optional[int]
-    ) -> Tuple[int, Tuple[int, int], int, Tuple[str, str], Optional[tuple]]:
-
-        indev = sd.query_devices(input_id)
-        outdev = sd.query_devices(output_id)
-
-        ch_pairs = self._candidate_channel_pairs(
-            int(indev.get("max_input_channels", 0)),
-            int(outdev.get("max_output_channels", 0)),
-        )
-        sr_list = self._candidate_samplerates(indev, outdev, user_sr)
-
-        # 1) как CLI / без extra_settings; 2) (опц.) wasapi shared
-        res = self._attempt_open(input_id, output_id, ch_pairs, sr_list, want_block,
-                                 allow_wasapi_shared=True)
-        if res:
-            return res
-
-        # 3) Авто-переключение на DirectSound, если сейчас WASAPI
-        in_name = (indev.get("name") or "")
-        out_name = (outdev.get("name") or "")
-        need_alt = self._is_host(input_id, "wasapi") or self._is_host(output_id, "wasapi")
-        if need_alt:
-            alt_in = self._find_alt_device(in_name, want_output=False, host_key="DirectSound")
-            alt_out = self._find_alt_device(out_name, want_output=True, host_key="DirectSound")
-            if alt_in is not None and alt_out is not None:
-                res = self._attempt_open(alt_in, alt_out, ch_pairs, sr_list, want_block,
-                                         allow_wasapi_shared=False)  # для DS extra_settings не нужны
-                if res:
-                    # сообщим в статусе, что подменили устройства
-                    self._params["auto_switched_to_directsound"] = True
-                    self._params["input_id_switched"] = alt_in
-                    self._params["output_id_switched"] = alt_out
-                    return res
-
-        # 4) Резерв: как CLI (mono, float32, blocksize=0, без extra_settings)
-        try:
-            sr_cli = int(user_sr or outdev.get("default_samplerate") or 48000)
-
-            def _cb_compat(indata, outdata, frames, t, status):
-                if outdata is not None:
-                    outdata[:] = 0
-
-            st = sd.Stream(device=(input_id, output_id),
-                           samplerate=sr_cli, blocksize=0,
-                           channels=1, dtype="float32",
-                           callback=_cb_compat)
-            st.close()
-            return sr_cli, (1, 1), 0, ("float32", "float32"), None
-        except Exception as e:
-            raise RuntimeError(f"Не удалось открыть аудиопоток: {e}")
-
-    # ---------- control ----------
-    def start(self,
-              input_id: int,
-              output_id: int,
-              sensitivity: float = 0.08,
-              vacuum: float = 1.0,
-              block: int = 480,
-              protect_speech: bool = True,
-              enable_triggers: bool = True,
-              enable_vacuum: bool = True,
-              ultra_anc: bool = True,
-              samplerate: Optional[int] = None) -> Dict[str, Any]:
-
-        self.stop()
-
-        # может заполняться в _pick_working_combo при авто-переключении
-        self._params = {}
-
-        sr, (in_ch, out_ch), bs, (dt_in, dt_out), extra = self._pick_working_combo(
-            input_id=input_id, output_id=output_id,
-            want_block=block, user_sr=samplerate
+        stream = sd.Stream(
+            device=(in_index, out_index),
+            samplerate=samplerate,
+            blocksize=block,
+            dtype="float32",
+            channels=(channels, 2 if channels < 2 else channels)  # in, out
         )
 
-        # внутренний блок для DSP (если драйвер дал bs=0 — берём 20мс, минимум 240)
-        proc_block = int(sr * 0.02) if bs == 0 else int(bs)
-        if proc_block < 240:
-            proc_block = 240
+        stream.start(callback=callback)
 
-        cfg = RTConfig(
-            trigger_sensitivity=sensitivity,
-            vacuum_strength=vacuum,
-            protect_speech=bool(protect_speech),
-            enable_triggers=bool(enable_triggers),
-            enable_vacuum=bool(enable_vacuum),
-            enable_denoise=True,
-            ultra_anc=bool(ultra_anc),
-        )
+        state.stream = stream
+        state.proc = proc
+        state.frames = 0
+        state.samplerate = samplerate
+        state.channels = channels
+        state.block = block
+        state.running = True
 
-        self._params.update({
-            "input_id": input_id, "output_id": output_id,
-            "samplerate": sr, "block": bs, "proc_block": proc_block,
-            "in_channels": in_ch, "out_channels": out_ch,
-            "in_dtype": dt_in, "out_dtype": dt_out,
-            "cfg": cfg.__dict__,
-            "hostapi_in": self._host_name_of(input_id),
-            "hostapi_out": self._host_name_of(output_id),
-            "extra_mode": ("wasapi-shared" if (extra is not None) else "none"),
-        })
+        return {
+            "ok": True,
+            "samplerate": samplerate,
+            "channels": channels,
+            "block": block,
+        }
 
-        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=proc_block)
-        self._proc = proc
-        self._running = True
-        self._last_error = None
-        self._status = {"running": True, "params": self._params, "frames": 0}
 
-        def _cb(indata, outdata, frames, t, status):
+def stop() -> Dict[str, Any]:
+    with state.lock:
+        if state.stream is not None:
             try:
-                if status:
-                    self._status["callback_status"] = str(status)
-
-                # вход -> моно на обработку
-                if indata.ndim == 2 and indata.shape[1] > 1:
-                    x = indata[:, :2].mean(axis=1).astype(np.float32)
-                else:
-                    x = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
-
-                y = proc.process_block(x)
-
-                # выравниваем длину
-                if len(y) < frames:
-                    buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
-                elif len(y) > frames:
-                    y = y[-frames:]
-
-                if outdata is not None:
-                    if outdata.ndim == 2 and outdata.shape[1] >= 2:
-                        outdata[:, 0] = y; outdata[:, 1] = y
-                    else:
-                        outdata[:, 0] = y
-
-                self._status["frames"] = self._status.get("frames", 0) + frames
-            except Exception as e:
-                self._last_error = str(e)
-                raise
-
-        def _run():
-            try:
-                kwargs = dict(
-                    device=(input_id, output_id),
-                    samplerate=sr,
-                    blocksize=bs,          # драйверу можно 0
-                    channels=(in_ch, out_ch),
-                    dtype=(dt_in, dt_out),
-                    callback=_cb,
-                )
-                if extra is not None:
-                    kwargs["extra_settings"] = extra  # только wasapi-shared
-                with sd.Stream(**kwargs) as st:
-                    self._stream = st
-                    while self._running:
-                        time.sleep(0.1)
-            except Exception as e:
-                self._last_error = str(e)
-            finally:
-                self._running = False
-                self._stream = None
-
-        th = threading.Thread(target=_run, daemon=True)
-        self._thread = th
-        th.start()
-        return self.status()
-
-    def stop(self) -> Dict[str, Any]:
-        self._running = False
-        if self._stream is not None:
-            try:
-                self._stream.stop(); self._stream.close()
+                state.stream.stop()
+                state.stream.close()
             except Exception:
                 pass
-            self._stream = None
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-        self._proc = None
-        self._status = {"running": False}
-        return self.status()
+            state.stream = None
+            state.proc = None
+        state.running = False
+        return {"ok": True}
 
-    def status(self) -> Dict[str, Any]:
-        s = dict(self._status)
-        s["running"] = bool(self._running)
-        s["last_error"] = self._last_error
-        return s
+
+def stats() -> Dict[str, Any]:
+    with state.lock:
+        return {
+            "running": state.running,
+            "frames": state.frames,
+            "samplerate": state.samplerate,
+            "channels": state.channels,
+            "block": state.block,
+        }
+
+
+def available_triggers() -> Dict[str, Any]:
+    """
+    Возвращает список {id,label,ru} для UI.
+    Если DSP ещё не создан, поднимаем временный процессор на дефолтных значениях.
+    """
+    with state.lock:
+        proc = state.proc
+
+    tmp_created = False
+    if proc is None:
+        # мини-временный процессор только чтобы прочитать список меток
+        proc = _make_processor({}, 48000, 480, [])
+        tmp_created = True
+
+    try:
+        items = proc.available_trigger_labels()
+        return {"ok": True, "items": items}
+    finally:
+        if tmp_created:
+            # просто даём GC убрать — ничего не стартовали
+            pass

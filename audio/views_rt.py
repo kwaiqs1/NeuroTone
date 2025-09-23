@@ -1,67 +1,72 @@
 # audio/views_rt.py
+# Веб-ручки для страницы /rt/: устройства, старт/стоп, список триггеров.
+
+import json
+from typing import Any, Dict, List
+
 from django.http import JsonResponse, HttpRequest
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
-import json
 
-from .rt_manager import RTSessionManager
+import sounddevice as sd
+
+from . import rt_manager
 
 
-def realtime_page(request: HttpRequest):
+def rt_page(request: HttpRequest):
     return render(request, "audio/realtime.html")
 
 
-def api_devices(request: HttpRequest):
-    try:
-        mgr = RTSessionManager.instance()
-        return JsonResponse(mgr.list_devices())
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+def list_devices(request: HttpRequest):
+    devs = sd.query_devices()
+    # строим красивый список
+    items = []
+    for idx, d in enumerate(devs):
+        in_ch = int(d.get("max_input_channels", 0))
+        out_ch = int(d.get("max_output_channels", 0))
+        host = d.get("hostapi", 0)
+        host_name = sd.query_hostapis()[host]["name"] if isinstance(host, int) else str(host)
+        name = f"[{idx}] {d['name']} — {host_name} (in:{in_ch}, out:{out_ch})"
+        items.append({
+            "index": idx,
+            "name": name,
+            "in": in_ch,
+            "out": out_ch,
+            "default_samplerate": d.get("default_samplerate"),
+        })
+    return JsonResponse({"ok": True, "items": items})
+
+
+def list_triggers(request: HttpRequest):
+    data = rt_manager.available_triggers()
+    # добавим плоский список только названий (ru) для быстрого поиска
+    simple = [it.get("ru") or it.get("label") for it in data.get("items", [])]
+    data["names"] = simple
+    return JsonResponse(data)
 
 
 @csrf_exempt
-def api_rt_start(request: HttpRequest):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST only"}, status=405)
+def start_rt(request: HttpRequest):
     try:
-        try:
-            payload = json.loads(request.body.decode("utf-8"))
-        except Exception:
-            payload = request.POST.dict()
+        if request.method != "POST":
+            return JsonResponse({"ok": False, "error": "POST only"}, status=405)
+        body = request.body.decode("utf-8") or "{}"
+        params: Dict[str, Any] = json.loads(body)
 
-        mgr = RTSessionManager.instance()
-        res = mgr.start(
-            input_id=int(payload.get("input_id")),
-            output_id=int(payload.get("output_id")),
-            sensitivity=float(payload.get("sensitivity", 0.08)),
-            vacuum=float(payload.get("vacuum", 1.0)),
-            block=int(payload.get("block", 480)),
-            protect_speech=bool(payload.get("protect_speech", True)),
-            enable_triggers=bool(payload.get("enable_triggers", True)),
-            enable_vacuum=bool(payload.get("enable_vacuum", True)),
-            ultra_anc=bool(payload.get("ultra_anc", True)),
-            samplerate=int(payload["samplerate"]) if payload.get("samplerate") else None,
-        )
-        return JsonResponse(res)
+        res = rt_manager.start(params)
+        return JsonResponse({"ok": True, **res})
     except Exception as e:
-        mgr = RTSessionManager.instance()
-        mgr.stop()
-        return JsonResponse({"running": False, "error": str(e)}, status=400)
+        return JsonResponse({"ok": False, "error": str(e)})
 
 
 @csrf_exempt
-def api_rt_stop(request: HttpRequest):
+def stop_rt(request: HttpRequest):
     try:
-        mgr = RTSessionManager.instance()
-        res = mgr.stop()
-        return JsonResponse(res)
+        res = rt_manager.stop()
+        return JsonResponse({"ok": True, **res})
     except Exception as e:
-        return JsonResponse({"running": False, "error": str(e)}, status=500)
+        return JsonResponse({"ok": False, "error": str(e)})
 
 
-def api_rt_status(request: HttpRequest):
-    try:
-        mgr = RTSessionManager.instance()
-        return JsonResponse(mgr.status())
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+def rt_stats(request: HttpRequest):
+    return JsonResponse({"ok": True, **rt_manager.stats()})
