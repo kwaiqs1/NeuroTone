@@ -1,59 +1,67 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
-import json
-from typing import Any, Dict
-
-from django.http import JsonResponse, HttpRequest, HttpResponse
+# audio/views_rt.py
+from django.http import JsonResponse, HttpRequest
 from django.shortcuts import render
-from django.views.decorators.csrf import csrf_exempt  # <-- важно
+from django.views.decorators.csrf import csrf_exempt
+import json
 
-from . import rt_manager
+from .rt_manager import RTSessionManager
 
 
-def rt_page(request: HttpRequest) -> HttpResponse:
+def realtime_page(request: HttpRequest):
     return render(request, "audio/realtime.html")
 
 
-def _json_ok(data: Dict[str, Any], status: int = 200) -> JsonResponse:
-    return JsonResponse(data, status=status, json_dumps_params={"ensure_ascii": False})
-
-
-def _json_err(msg: str, status: int = 400) -> JsonResponse:
-    return JsonResponse({"ok": False, "error": msg}, status=status, json_dumps_params={"ensure_ascii": False})
-
-
-def rt_devices(request: HttpRequest) -> JsonResponse:
-    data = rt_manager.list_devices()
-    if not data.get("ok"):
-        return _json_err(data.get("error", "devices error"))
-    return _json_ok(data)
-
-
-def rt_triggers(request: HttpRequest) -> JsonResponse:
-    return _json_ok(rt_manager.trigger_list())
-
-
-@csrf_exempt  # <-- снимаем CSRF, чтобы fetch POST из UI не получал HTML-403
-def rt_start(request: HttpRequest) -> JsonResponse:
-    if request.method != "POST":
-        return _json_err("POST required", 405)
-
+def api_devices(request: HttpRequest):
     try:
-        payload = json.loads(request.body or "{}")
-    except Exception:
-        payload = {}
-
-    result = rt_manager.start(payload)
-    return _json_ok(result) if result.get("ok") else _json_err(result.get("error", "start error"))
+        mgr = RTSessionManager.instance()
+        return JsonResponse(mgr.list_devices())
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
-@csrf_exempt  # <-- тоже важно
-def rt_stop(request: HttpRequest) -> JsonResponse:
+@csrf_exempt
+def api_rt_start(request: HttpRequest):
     if request.method != "POST":
-        return _json_err("POST required", 405)
-    return _json_ok(rt_manager.stop())
+        return JsonResponse({"error": "POST only"}, status=405)
+    try:
+        try:
+            payload = json.loads(request.body.decode("utf-8"))
+        except Exception:
+            payload = request.POST.dict()
+
+        mgr = RTSessionManager.instance()
+        res = mgr.start(
+            input_id=int(payload.get("input_id")),
+            output_id=int(payload.get("output_id")),
+            sensitivity=float(payload.get("sensitivity", 0.08)),
+            vacuum=float(payload.get("vacuum", 1.0)),
+            block=int(payload.get("block", 480)),
+            protect_speech=bool(payload.get("protect_speech", True)),
+            enable_triggers=bool(payload.get("enable_triggers", True)),
+            enable_vacuum=bool(payload.get("enable_vacuum", True)),
+            ultra_anc=bool(payload.get("ultra_anc", True)),
+            samplerate=int(payload["samplerate"]) if payload.get("samplerate") else None,
+        )
+        return JsonResponse(res)
+    except Exception as e:
+        mgr = RTSessionManager.instance()
+        mgr.stop()
+        return JsonResponse({"running": False, "error": str(e)}, status=400)
 
 
-def rt_stats(request: HttpRequest) -> JsonResponse:
-    return _json_ok(rt_manager.stats())
+@csrf_exempt
+def api_rt_stop(request: HttpRequest):
+    try:
+        mgr = RTSessionManager.instance()
+        res = mgr.stop()
+        return JsonResponse(res)
+    except Exception as e:
+        return JsonResponse({"running": False, "error": str(e)}, status=500)
+
+
+def api_rt_status(request: HttpRequest):
+    try:
+        mgr = RTSessionManager.instance()
+        return JsonResponse(mgr.status())
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)

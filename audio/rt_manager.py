@@ -1,192 +1,365 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
+# audio/rt_manager.py
+# Надёжный запуск real-time под Windows:
+#  - сперва без extra_settings (совместимо как CLI),
+#  - затем WASAPI shared (если доступен),
+#  - при неудаче авто-переключение на DirectSound,
+#  - безопасный внутренний blocksize для DSP (без деления на 0),
+#  - финальный fallback как в CLI.
 
 import threading
-from typing import Any, Dict, List, Optional
+import time
+from typing import Optional, Dict, Any, Tuple, List
 
+import numpy as np
 import sounddevice as sd
 
-# Реальный DSP/ИИ-процессор и его конфиг
-try:
-    from .realtime import RealTimeProcessor, RTConfig as _RTConfig
-except Exception as e:  # fall back, чтобы страница не падала при импорт-ошибках
-    RealTimeProcessor = None  # type: ignore
-    _RTConfig = None          # type: ignore
-    _import_error = e
-else:
-    _import_error = None
+from .realtime import RealTimeProcessor, RTConfig
 
 
-# Безопасная обёртка вокруг RTConfig: принимаем «алиасы» полей
-def _make_rt_config(cfg: Dict[str, Any]) -> Any:
-    """
-    Приводим входные параметры к тем, что реально есть у RTConfig в realtime.py.
-    Поддерживаем алиасы: 'trigger_threshold' -> 'sensitivity' и т.п.
-    """
-    if _RTConfig is None:
-        raise RuntimeError(f"Realtime engine is not available: {_import_error}")
+class RTSessionManager:
+    _instance = None
+    _lock = threading.Lock()
 
-    # алиасы/значения по умолчанию
-    in_index = int(cfg.get("in"))
-    out_index = int(cfg.get("out"))
-    samplerate = cfg.get("sr")
-    samplerate = int(samplerate) if samplerate not in (None, "", "null") else None
-    block = int(cfg.get("block", 480))
+    def __init__(self):
+        self._thread: Optional[threading.Thread] = None
+        self._stream: Optional[sd.Stream] = None
+        self._running: bool = False
+        self._status: Dict[str, Any] = {"running": False}
+        self._last_error: Optional[str] = None
+        self._proc: Optional[RealTimeProcessor] = None
+        self._params: Dict[str, Any] = {}
 
-    # ключ чувствительности — фронт шлёт 'sensitivity'; старые версии могли слать 'trigger_threshold'
-    sensitivity = cfg.get("sensitivity", cfg.get("trigger_threshold", 0.08))
-    sensitivity = float(sensitivity)
+    @classmethod
+    def instance(cls) -> "RTSessionManager":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = RTSessionManager()
+        return cls._instance
 
-    vacuum_strength = float(cfg.get("vacuum_strength", 1.0))
-    protect_speech = bool(cfg.get("protect_speech", True))
-    trigger_kill = bool(cfg.get("trigger_kill", True))
-    ultra_anc = bool(cfg.get("ultra_anc", False))
-    triggers = cfg.get("triggers") or []
-    if not isinstance(triggers, list):
-        triggers = [triggers]
+    # ---------- devices ----------
+    @staticmethod
+    def list_devices() -> Dict[str, Any]:
+        devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
 
-    # Конструируем тот же RTConfig, что ожидает движок
-    return _RTConfig(
-        in_index=in_index,
-        out_index=out_index,
-        samplerate=samplerate,
-        block=block,
-        sensitivity=sensitivity,
-        vacuum_strength=vacuum_strength,
-        protect_speech=protect_speech,
-        trigger_kill=trigger_kill,
-        ultra_anc=ultra_anc,
-        triggers=triggers,
-    )
-
-
-# Глобальное состояние одного RT-потока
-_lock = threading.Lock()
-_rt = None        # type: Optional[RealTimeProcessor]
-_last_error = ""
-_stats: Dict[str, Any] = {
-    "running": False,
-    "frames": 0,
-    "samplerate": None,
-    "channels": None,
-    "block": None,
-    "last_error": "",
-}
-
-
-def _set_error(msg: str) -> None:
-    global _last_error, _stats
-    _last_error = msg
-    _stats["last_error"] = msg
-
-
-def list_devices() -> Dict[str, Any]:
-    """Вернёт входы/выходы и дефолтные индексы для UI."""
-    try:
-        devices = sd.query_devices()
-        default_in, default_out = sd.default.device
-    except Exception as e:
-        return {"ok": False, "error": str(e), "inputs": [], "outputs": []}
-
-    inputs, outputs = [], []
-    for i, d in enumerate(devices):
-        label = f"[{i}] {d['name']} — {d['hostapi']}" if "hostapi" in d else f"[{i}] {d['name']}"
-        if int(d.get("max_input_channels", 0)) > 0:
-            inputs.append({"index": i, "label": label})
-        if int(d.get("max_output_channels", 0)) > 0:
-            outputs.append({"index": i, "label": label})
-
-    return {
-        "ok": True,
-        "inputs": inputs,
-        "outputs": outputs,
-        "default_in": default_in if isinstance(default_in, int) else None,
-        "default_out": default_out if isinstance(default_out, int) else None,
-    }
-
-
-# Небольшая библиотека «триггеров» (рус)
-try:
-    # если в realtime.py уже есть словарь с русским списком — используем его
-    from .realtime import TRIGGER_LIBRARY_RU as _TRIGS  # type: ignore
-    TRIGGERS_RU = list(_TRIGS)
-except Exception:
-    TRIGGERS_RU = [
-        "чавканье", "тик-так", "стук", "крик", "печать на клавиатуре",
-        "скрип", "звон посуды", "шёпот", "кашель", "чих", "свист", "хлопок",
-        "шорох пакета", "лай собаки", "смех",
-    ]
-
-
-def trigger_list() -> Dict[str, Any]:
-    return {"ok": True, "items": TRIGGERS_RU}
-
-
-def start(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Стартуем один RT-процессор (если есть старый — останавливаем)."""
-    global _rt, _stats
-    with _lock:
-        _set_error("")
-        # останавливаем прежний
-        if _rt is not None:
+        def host_name(idx):
             try:
-                _rt.stop()
+                return hostapis[idx]["name"]
+            except Exception:
+                return "Unknown"
+
+        out = []
+        for i, d in enumerate(devs):
+            out.append({
+                "id": i,
+                "name": d.get("name"),
+                "hostapi": host_name(d.get("hostapi", 0)),
+                "max_input_channels": d.get("max_input_channels", 0),
+                "max_output_channels": d.get("max_output_channels", 0),
+                "default_samplerate": d.get("default_samplerate", None),
+            })
+        return {"devices": out, "default_input": sd.default.device[0], "default_output": sd.default.device[1]}
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _host_name_of(device_id: int) -> str:
+        api_idx = sd.query_devices(device_id).get("hostapi", 0)
+        return sd.query_hostapis()[api_idx].get("name", "Unknown")
+
+    @staticmethod
+    def _is_host(device_id: int, key: str) -> bool:
+        return key.lower() in RTSessionManager._host_name_of(device_id).lower()
+
+    @staticmethod
+    def _mk_wasapi_shared(device_id: int):
+        if RTSessionManager._is_host(device_id, "wasapi"):
+            return sd.WasapiSettings(exclusive=False)
+        return None
+
+    @staticmethod
+    def _find_alt_device(name_sub: str, want_output: bool, host_key: str) -> Optional[int]:
+        """Находит устройство с тем же именем (или его частью) в другом Host API, например DirectSound."""
+        name_sub = (name_sub or "").lower()
+        devs = sd.query_devices()
+        hostapis = sd.query_hostapis()
+
+        def hostname(idx):
+            try:
+                return hostapis[idx]["name"].lower()
+            except Exception:
+                return ""
+
+        best = None
+        for i, d in enumerate(devs):
+            if name_sub and name_sub not in (d.get("name") or "").lower():
+                continue
+            api = hostname(d.get("hostapi", 0))
+            if host_key.lower() not in api:
+                continue
+            max_in = int(d.get("max_input_channels", 0))
+            max_out = int(d.get("max_output_channels", 0))
+            if want_output and max_out > 0:
+                best = i; break
+            if not want_output and max_in > 0:
+                best = i; break
+        return best
+
+    def _candidate_samplerates(self, indev, outdev, user_sr: Optional[int]) -> List[int]:
+        s: List[int] = []
+        if user_sr:
+            s.append(int(user_sr))
+        for v in [outdev.get("default_samplerate"), indev.get("default_samplerate"), 48000, 44100]:
+            if v and int(v) not in s:
+                s.append(int(v))
+        return s
+
+    def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
+        pairs: List[Tuple[int, int]] = []
+        if in_max >= 1 and out_max >= 1:
+            pairs.append((1, 1))        # максимально совместимо
+        if in_max >= 1 and out_max >= 2:
+            pairs.append((1, 2))
+        if in_max >= 2 and out_max >= 2:
+            pairs.append((2, 2))
+        if in_max >= 2 and out_max >= 1:
+            pairs.append((2, 1))
+        # уникализируем
+        seen = set(); out = []
+        for p in pairs:
+            if p not in seen:
+                out.append(p); seen.add(p)
+        if not out:
+            raise RuntimeError("Выбранные устройства несовместимы по числу каналов.")
+        return out
+
+    def _attempt_open(self, input_id: int, output_id: int,
+                      ch_pairs: List[Tuple[int,int]],
+                      sr_list: List[int],
+                      want_block: int,
+                      allow_wasapi_shared: bool) -> Optional[Tuple[int, Tuple[int,int], int, Tuple[str,str], Optional[tuple]]]:
+        """Пробует открыть поток: сначала без extra_settings, затем (опц.) WASAPI shared."""
+        blocks = [0, int(want_block), 960, 1024, 2048, 512, 256]
+        dtype_pairs = [("float32", "float32"), ("int16", "int16")]
+
+        # порядок extra_settings: сначала None (как CLI), потом WASAPI shared при желании
+        extras: List[Optional[tuple]] = [None]
+        if allow_wasapi_shared:
+            ex_in = self._mk_wasapi_shared(input_id)
+            ex_out = self._mk_wasapi_shared(output_id)
+            if ex_in or ex_out:
+                extras.append((ex_in, ex_out))
+
+        def _dummy_cb(indata, outdata, frames, t, status):
+            if outdata is not None:
+                outdata[:] = 0
+
+        last_err = None
+        for (in_ch, out_ch) in ch_pairs:
+            for sr in sr_list:
+                for bs in blocks:
+                    for (dt_in, dt_out) in dtype_pairs:
+                        for ex in extras:
+                            kwargs = dict(
+                                device=(input_id, output_id),
+                                samplerate=int(sr),
+                                blocksize=int(bs),
+                                callback=_dummy_cb,
+                                channels=(int(in_ch), int(out_ch)),
+                                dtype=(dt_in, dt_out),
+                            )
+                            if ex is not None:
+                                kwargs["extra_settings"] = ex
+                            try:
+                                st = sd.Stream(**kwargs)
+                                st.close()
+                                return (int(sr), (int(in_ch), int(out_ch)), int(bs), (dt_in, dt_out), ex)
+                            except Exception as e:
+                                last_err = e
+                                continue
+        return None
+
+    def _pick_working_combo(
+        self, input_id: int, output_id: int, want_block: int, user_sr: Optional[int]
+    ) -> Tuple[int, Tuple[int, int], int, Tuple[str, str], Optional[tuple]]:
+
+        indev = sd.query_devices(input_id)
+        outdev = sd.query_devices(output_id)
+
+        ch_pairs = self._candidate_channel_pairs(
+            int(indev.get("max_input_channels", 0)),
+            int(outdev.get("max_output_channels", 0)),
+        )
+        sr_list = self._candidate_samplerates(indev, outdev, user_sr)
+
+        # 1) как CLI / без extra_settings; 2) (опц.) wasapi shared
+        res = self._attempt_open(input_id, output_id, ch_pairs, sr_list, want_block,
+                                 allow_wasapi_shared=True)
+        if res:
+            return res
+
+        # 3) Авто-переключение на DirectSound, если сейчас WASAPI
+        in_name = (indev.get("name") or "")
+        out_name = (outdev.get("name") or "")
+        need_alt = self._is_host(input_id, "wasapi") or self._is_host(output_id, "wasapi")
+        if need_alt:
+            alt_in = self._find_alt_device(in_name, want_output=False, host_key="DirectSound")
+            alt_out = self._find_alt_device(out_name, want_output=True, host_key="DirectSound")
+            if alt_in is not None and alt_out is not None:
+                res = self._attempt_open(alt_in, alt_out, ch_pairs, sr_list, want_block,
+                                         allow_wasapi_shared=False)  # для DS extra_settings не нужны
+                if res:
+                    # сообщим в статусе, что подменили устройства
+                    self._params["auto_switched_to_directsound"] = True
+                    self._params["input_id_switched"] = alt_in
+                    self._params["output_id_switched"] = alt_out
+                    return res
+
+        # 4) Резерв: как CLI (mono, float32, blocksize=0, без extra_settings)
+        try:
+            sr_cli = int(user_sr or outdev.get("default_samplerate") or 48000)
+
+            def _cb_compat(indata, outdata, frames, t, status):
+                if outdata is not None:
+                    outdata[:] = 0
+
+            st = sd.Stream(device=(input_id, output_id),
+                           samplerate=sr_cli, blocksize=0,
+                           channels=1, dtype="float32",
+                           callback=_cb_compat)
+            st.close()
+            return sr_cli, (1, 1), 0, ("float32", "float32"), None
+        except Exception as e:
+            raise RuntimeError(f"Не удалось открыть аудиопоток: {e}")
+
+    # ---------- control ----------
+    def start(self,
+              input_id: int,
+              output_id: int,
+              sensitivity: float = 0.08,
+              vacuum: float = 1.0,
+              block: int = 480,
+              protect_speech: bool = True,
+              enable_triggers: bool = True,
+              enable_vacuum: bool = True,
+              ultra_anc: bool = True,
+              samplerate: Optional[int] = None) -> Dict[str, Any]:
+
+        self.stop()
+
+        # может заполняться в _pick_working_combo при авто-переключении
+        self._params = {}
+
+        sr, (in_ch, out_ch), bs, (dt_in, dt_out), extra = self._pick_working_combo(
+            input_id=input_id, output_id=output_id,
+            want_block=block, user_sr=samplerate
+        )
+
+        # внутренний блок для DSP (если драйвер дал bs=0 — берём 20мс, минимум 240)
+        proc_block = int(sr * 0.02) if bs == 0 else int(bs)
+        if proc_block < 240:
+            proc_block = 240
+
+        cfg = RTConfig(
+            trigger_sensitivity=sensitivity,
+            vacuum_strength=vacuum,
+            protect_speech=bool(protect_speech),
+            enable_triggers=bool(enable_triggers),
+            enable_vacuum=bool(enable_vacuum),
+            enable_denoise=True,
+            ultra_anc=bool(ultra_anc),
+        )
+
+        self._params.update({
+            "input_id": input_id, "output_id": output_id,
+            "samplerate": sr, "block": bs, "proc_block": proc_block,
+            "in_channels": in_ch, "out_channels": out_ch,
+            "in_dtype": dt_in, "out_dtype": dt_out,
+            "cfg": cfg.__dict__,
+            "hostapi_in": self._host_name_of(input_id),
+            "hostapi_out": self._host_name_of(output_id),
+            "extra_mode": ("wasapi-shared" if (extra is not None) else "none"),
+        })
+
+        proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=proc_block)
+        self._proc = proc
+        self._running = True
+        self._last_error = None
+        self._status = {"running": True, "params": self._params, "frames": 0}
+
+        def _cb(indata, outdata, frames, t, status):
+            try:
+                if status:
+                    self._status["callback_status"] = str(status)
+
+                # вход -> моно на обработку
+                if indata.ndim == 2 and indata.shape[1] > 1:
+                    x = indata[:, :2].mean(axis=1).astype(np.float32)
+                else:
+                    x = indata[:, 0].astype(np.float32) if indata.ndim == 2 else indata.astype(np.float32)
+
+                y = proc.process_block(x)
+
+                # выравниваем длину
+                if len(y) < frames:
+                    buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
+                elif len(y) > frames:
+                    y = y[-frames:]
+
+                if outdata is not None:
+                    if outdata.ndim == 2 and outdata.shape[1] >= 2:
+                        outdata[:, 0] = y; outdata[:, 1] = y
+                    else:
+                        outdata[:, 0] = y
+
+                self._status["frames"] = self._status.get("frames", 0) + frames
+            except Exception as e:
+                self._last_error = str(e)
+                raise
+
+        def _run():
+            try:
+                kwargs = dict(
+                    device=(input_id, output_id),
+                    samplerate=sr,
+                    blocksize=bs,          # драйверу можно 0
+                    channels=(in_ch, out_ch),
+                    dtype=(dt_in, dt_out),
+                    callback=_cb,
+                )
+                if extra is not None:
+                    kwargs["extra_settings"] = extra  # только wasapi-shared
+                with sd.Stream(**kwargs) as st:
+                    self._stream = st
+                    while self._running:
+                        time.sleep(0.1)
+            except Exception as e:
+                self._last_error = str(e)
+            finally:
+                self._running = False
+                self._stream = None
+
+        th = threading.Thread(target=_run, daemon=True)
+        self._thread = th
+        th.start()
+        return self.status()
+
+    def stop(self) -> Dict[str, Any]:
+        self._running = False
+        if self._stream is not None:
+            try:
+                self._stream.stop(); self._stream.close()
             except Exception:
                 pass
-            _rt = None
-        # создаём новый
-        try:
-            rt_cfg = _make_rt_config(cfg)
-            if RealTimeProcessor is None:
-                raise RuntimeError(f"Realtime engine is not available: {_import_error}")
-            _rt = RealTimeProcessor(rt_cfg)
-            _rt.start()
-        except Exception as e:
-            _set_error(str(e))
-            return {"ok": False, "error": str(e)}
+            self._stream = None
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self._proc = None
+        self._status = {"running": False}
+        return self.status()
 
-        # обновляем статусы
-        try:
-            _stats.update({
-                "running": True,
-                "frames": 0,
-                "samplerate": getattr(_rt, "sr", getattr(_rt, "samplerate", None)),
-                "channels": getattr(_rt, "channels", 1),
-                "block": getattr(_rt, "block", cfg.get("block", 480)),
-                "last_error": "",
-            })
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "sr": _stats["samplerate"],
-            "channels": _stats["channels"],
-            "block": _stats["block"],
-        }
-
-
-def stop() -> Dict[str, Any]:
-    global _rt, _stats
-    with _lock:
-        if _rt is not None:
-            try:
-                _rt.stop()
-            except Exception as e:
-                _set_error(str(e))
-            _rt = None
-        _stats["running"] = False
-    return {"ok": True}
-
-
-def stats() -> Dict[str, Any]:
-    """Немного статистики для UI."""
-    global _rt, _stats
-    with _lock:
-        # аккуратно читаем счётчик кадров, если движок его ведёт
-        try:
-            if _rt is not None and hasattr(_rt, "frames_processed"):
-                _stats["frames"] = int(getattr(_rt, "frames_processed"))
-        except Exception:
-            pass
-        return dict(_stats)
+    def status(self) -> Dict[str, Any]:
+        s = dict(self._status)
+        s["running"] = bool(self._running)
+        s["last_error"] = self._last_error
+        return s

@@ -1,16 +1,17 @@
 # audio/realtime.py
-# Реал-тайм обработчик c гибридным шумодавом и гибкой выборкой триггеров (YAMNet).
+# Реал-тайм: улучшенное качество (OLA с sqrt-Hann, сглаживание маски),
+# более сильный, но стабильный шумодав. Триггеры — из предыдущей версии.
 
 from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass
-from typing import Dict, List, Iterable, Optional, Set
+from typing import Optional, Dict
 
 import numpy as np
 from scipy.signal import butter, sosfilt
 
-# --- опциональная YAMNet ---
+# YAMNet (опционально)
 try:
     import tensorflow as tf
     import tensorflow_hub as hub
@@ -34,7 +35,6 @@ class RTConfig:
     ultra_anc: bool = True
 
 
-# ----------------- утилиты -----------------
 def hz_to_bin(hz: float, nfft: int, sr: int) -> int:
     return int(np.clip(round(hz * nfft / sr), 0, nfft // 2))
 
@@ -44,64 +44,22 @@ def undb(x_db: float) -> float:
 
 
 def sqrt_hann(n: int) -> np.ndarray:
+    # sqrt-Hann даёт идеальную реконструкцию при hop=n/2
     h = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
     return np.sqrt(np.maximum(h, 1e-8)).astype(np.float32)
 
 
-# ----------------- YAMNet wrapper -----------------
-_COMMON_TRIGGERS = [
-    "Chewing, mastication", "Lip smacking", "Crunch",
-    "Typing", "Computer keyboard", "Mouse click", "Mouse", "Keys jangling",
-    "Knock", "Tap", "Clapping", "Tick-tock", "Gulp", "Cough", "Sneeze",
-    "Sniff", "Breathing", "Telephone bell ringing", "Alarm clock",
-    "Siren", "Buzzer"
-]
-
-def _ru_label(en: str) -> str:
-    # Очень лёгкий «словари + эвристики», чтобы всё показывалось по-русски.
-    # Для неизвестных меток — просто возвращаем исходную строку.
-    m = {
-        "Chewing, mastication": "Чавканье / пережёвывание",
-        "Lip smacking": "Чмокание / лип-шум",
-        "Crunch": "Хруст",
-        "Typing": "Печать (набор текста)",
-        "Computer keyboard": "Клавиатура",
-        "Mouse click": "Щелчок мыши",
-        "Mouse": "Мышь (звук)",
-        "Keys jangling": "Звенящие ключи",
-        "Knock": "Стук",
-        "Tap": "Постукивание",
-        "Clapping": "Хлопок",
-        "Tick-tock": "Тик-так",
-        "Gulp": "Глоток / сглатывание",
-        "Cough": "Кашель",
-        "Sneeze": "Чих",
-        "Sniff": "Шмыганье",
-        "Breathing": "Дыхание",
-        "Telephone bell ringing": "Звонок телефона",
-        "Alarm clock": "Будильник",
-        "Siren": "Сирена",
-        "Buzzer": "Зуммер / противный писк",
-        "Speech": "Речь",
-        "Whispering": "Шёпот",
-        "Chatter": "Гул голосов",
-        "Footsteps": "Шаги",
-        "Door": "Дверь",
-        "Doorbell": "Дверной звонок",
-    }
-    return m.get(en, en)
-
+# ---------- YAMNet (опц.) ----------
 class YamnetTrigger:
-    """
-    Лёгкая RT-обёртка:
-    - Буфер ~1 c при 16 кГц, раз в 0.5 c обновляет вероятности.
-    - Список таргетов можно менять на лету (из UI).
-    """
-    def __init__(self, sr_stream: int, selected: Optional[Iterable[str]] = None):
+    def __init__(self, sr_stream: int):
         self.enabled = _YAMNET_OK
         self.lock = threading.Lock()
         self.last_probs: Dict[str, float] = {}
-        self.targets: Set[str] = set(selected) if selected else set(_COMMON_TRIGGERS)
+        self.targets = {
+            "Chewing, mastication", "Crunch", "Lip smacking",
+            "Typing", "Computer keyboard", "Mouse click",
+            "Tick-tock", "Knock", "Clapping", "Tap", "Keys jangling",
+        }
         self._acc_t = 0.0
         self._period = 0.5
         self._buf = np.zeros(16000, dtype=np.float32)
@@ -115,16 +73,6 @@ class YamnetTrigger:
                 self._labels = [ln.strip() for ln in labels_txt.splitlines() if ln.strip()]
             except Exception:
                 self.enabled = False
-
-    def set_targets(self, selected: Iterable[str]):
-        with self.lock:
-            self.targets = set(selected)
-
-    def available_labels(self) -> List[str]:
-        # Все классы YAMNet (если доступен), иначе — минимальный набор
-        if self.enabled:
-            return list(self._labels)
-        return list(_COMMON_TRIGGERS)
 
     def push(self, x: np.ndarray, sr: int, dt: float):
         if not self.enabled:
@@ -149,7 +97,7 @@ class YamnetTrigger:
             wav = np.copy(self._buf).astype(np.float32)
             scores, _, _ = self._yam(wav)
             p = np.mean(scores.numpy(), axis=0)
-            top: Dict[str, float] = {}
+            top = {}
             for i, pr in enumerate(p):
                 name = self._labels[i] if i < len(self._labels) else str(i)
                 if name in self.targets:
@@ -169,17 +117,17 @@ class YamnetTrigger:
         return float(np.clip((m - 0.1) / 0.4, 0.0, 1.0))
 
 
-# ----------------- основной DSP -----------------
+# ---------- основной процессор ----------
 class RealTimeProcessor:
-    def __init__(self, cfg: RTConfig, stream_sr: int = 48000, blocksize: int = 480,
-                 selected_triggers: Optional[Iterable[str]] = None):
+    def __init__(self, cfg: RTConfig, stream_sr: int = 48000, blocksize: int = 480):
         self.cfg = cfg
         self.sr = int(np.clip(stream_sr, SR_SAFE_MIN, SR_SAFE_MAX))
 
-        # STFT: ~40 мс окно, 50% overlap
+        # Внутренняя STFT-конфигурация (не зависящая от размера колбэка):
+        # ~40 мс окно, 50% overlap → мягкая маска и меньше «рубленности»
         target_win_ms = 40.0
         nfft = int(2 ** math.ceil(math.log2(self.sr * target_win_ms / 1000.0)))
-        nfft = int(np.clip(nfft, 1024, 4096))
+        nfft = int(np.clip(nfft, 1024, 4096))  # пределы
         self.nfft = nfft
         self.hop = nfft // 2
         self.win = sqrt_hann(nfft)
@@ -187,10 +135,11 @@ class RealTimeProcessor:
 
         # Пред/пост фильтры
         self.hpf = butter(2, 60 / (self.sr / 2), btype='highpass', output='sos')
+        # поднял LPF, чтобы речь не была «радио»:
         lpf_cut = min(16000, int(self.sr * 0.45))
         self.lpf = butter(4, lpf_cut / (self.sr / 2), btype='lowpass', output='sos')
 
-        # Буферы STFT-OLA
+        # Буферы стриминга (STFT-OLA)
         self._inbuf = np.zeros(0, dtype=np.float32)
         self._prev_tail = np.zeros(self.nfft - self.hop, dtype=np.float32)
         self._outbuf = np.zeros(0, dtype=np.float32)
@@ -200,19 +149,21 @@ class RealTimeProcessor:
         self.alpha_noise = 0.92
         self.prev_gain = np.ones_like(self.noise_psd)
 
-        # VAD/Transient
+        # VAD
         self.vad_hist = 0.0
+
+        # YAMNet (опционально)
+        self.yam = YamnetTrigger(self.sr)
+
+        # transient killer память
         self.last_mag = np.zeros(self.nfft // 2 + 1, dtype=np.float32)
 
-        # Комфорт-шум
+        # очень тихий комфорт-шум
         rng = np.random.default_rng(123)
         w = rng.standard_normal(self.nfft).astype(np.float32)
-        self.comfort = (w / (np.max(np.abs(w)) + self.eps) * undb(-62)).astype(np.float32)
+        self.comfort = (w / np.max(np.abs(w) + self.eps) * undb(-62)).astype(np.float32)
 
-        # YAMNet
-        self.yam = YamnetTrigger(self.sr, selected_triggers)
-
-    # --- helpers ---
+    # --------- VAD / энергия ---------
     def _energy_band(self, x: np.ndarray, lo=200, hi=4000) -> float:
         X = np.fft.rfft(x * self.win[:x.size], n=self.nfft)
         mag = np.abs(X)
@@ -227,18 +178,20 @@ class RealTimeProcessor:
         self.vad_hist = 0.9 * self.vad_hist + 0.1 * p
         return float(np.clip(self.vad_hist, 0.0, 1.0))
 
-    # --- один STFT кадр ---
+    # --------- один STFT-кадр ---------
     def _process_frame(self, frame: np.ndarray, p_speech: float, trig_boost: float) -> np.ndarray:
         X = np.fft.rfft(frame * self.win)
         mag = np.abs(X).astype(np.float32)
         phase = np.angle(X).astype(np.float32)
 
+        # обновление шума
         upd = self.alpha_noise if p_speech > 0.4 else 0.80
         self.noise_psd = upd * self.noise_psd + (1.0 - upd) * (mag ** 2)
 
         y = mag.copy()
 
         if self.cfg.enable_denoise:
+            # Винер + оверсабтракшн, сглаживание маски
             base_alpha = 2.2 + (1.6 if self.cfg.ultra_anc else 0.0) + 1.6 * trig_boost
             noise = np.maximum(self.noise_psd, 1e-12)
             snr = np.maximum((mag ** 2) / noise - 1.0, 0.0)
@@ -261,11 +214,11 @@ class RealTimeProcessor:
                 protect = 0.3 + 0.7 * (1.0 - self.cfg.trigger_sensitivity)
                 gain[lo:hi] = np.maximum(gain[lo:hi], protect * 0.4)
 
-            # сглаживание маски
+            # сглаживание маски по времени (убирает «песок/дробление»)
             self.prev_gain = 0.75 * self.prev_gain + 0.25 * gain
             gain = self.prev_gain
 
-            # ограничение глубины
+            # ограничим минимум (слишком глубокое — даёт развал тембра)
             min_gain = undb(-38.0 - 10.0 * float(self.cfg.vacuum_strength))
             gain = np.clip(gain, min_gain, 1.0)
 
@@ -274,20 +227,22 @@ class RealTimeProcessor:
         # вакуум
         if self.cfg.enable_vacuum:
             vac = np.clip(self.cfg.vacuum_strength, 0.0, 1.0)
-            att = 16.0 + 16.0 * vac + 8.0 * trig_boost
+            att = 16.0 + 16.0 * vac + 8.0 * trig_boost   # дБ
             post = undb(-att) ** (1.0 - p_speech)
             y *= post
 
-        # пол (анти-дззз)
+        # очень тихий пол — чтобы не «дззз»
         floor = undb(-62.0)
         y = np.maximum(y, floor * np.sqrt(self.noise_psd))
 
         Y = y * np.exp(1j * phase)
         y_time = np.fft.irfft(Y).real.astype(np.float32)
+
+        # пост-LPF чтобы смягчить кодек BT/вч песок
         y_time = sosfilt(self.lpf, y_time)
         return y_time
 
-    # --- публичный блок ---
+    # --------- публичный шаг ---------
     def process_block(self, mono_in: np.ndarray) -> np.ndarray:
         x = mono_in.astype(np.float32)
         x = sosfilt(self.hpf, x)
@@ -298,31 +253,43 @@ class RealTimeProcessor:
         trig_boost = self.yam.boost() if self.cfg.enable_triggers else 0.0
         p_speech_now = self._vad(x) if self.cfg.protect_speech else 0.0
 
+        # накапливаем вход
         self._inbuf = np.concatenate([self._inbuf, x])
         out_chunks = []
 
         while self._inbuf.size >= self.hop:
+            # формируем кадр: прошлые nfft-hop + новые hop
             frame = np.empty(self.nfft, dtype=np.float32)
             frame[:self.nfft - self.hop] = self._prev_tail
             new = self._inbuf[:self.hop]
             frame[self.nfft - self.hop:] = new
-            self._prev_tail = frame[self.hop:]
+            self._prev_tail = frame[self.hop:]  # сдвиг для след. кадра
+            # потребляем hop
             self._inbuf = self._inbuf[self.hop:]
 
+            # VAD сглажим с прошлым (более стабильный)
             p_speech = 0.7 * self.vad_hist + 0.3 * p_speech_now
+
             y_frame = self._process_frame(frame, p_speech, trig_boost)
 
+            # OLA со sqrt-Hann: суммирование двух половинок → идеальная реконструкция
+            # отдаём сразу первую половину, вторую держим как overlap
             a = y_frame[:self.hop] * self.win[:self.hop]
             b = y_frame[self.hop:] * self.win[self.hop:]
 
             if self._outbuf.size < self.hop:
+                # расширим, если пусто
                 pad = np.zeros(self.hop - self._outbuf.size, dtype=np.float32)
                 self._outbuf = np.concatenate([self._outbuf, pad])
 
+            # складываем текущий "a" с накопленным overlap
             mixed = (self._outbuf[:self.hop] + a)
             out_chunks.append(mixed.astype(np.float32))
+
+            # готовим overlap для следующего шага
             self._outbuf = b.copy()
 
+        # если накопилось меньше hop, отдаём то, что есть (мягко)
         total_len = len(x)
         if out_chunks:
             y = np.concatenate(out_chunks)
@@ -330,19 +297,16 @@ class RealTimeProcessor:
             y = np.zeros(0, dtype=np.float32)
 
         if y.size < total_len:
+            # добираем недостающее из текущего overlap (без окна — он уже с win)
             need = total_len - y.size
             tail = self._outbuf[:need] if self._outbuf.size >= need else np.pad(self._outbuf, (0, need - self._outbuf.size))
             y = np.concatenate([y, tail])
-            self._outbuf = self._outbuf[need:] if self._outbuf.size >= need else np.zeros(0, dtype=np.float32)
+            # уменьшить буфер overlap на выданное
+            if self._outbuf.size >= need:
+                self._outbuf = self._outbuf[need:]
+            else:
+                self._outbuf = np.zeros(0, dtype=np.float32)
         elif y.size > total_len:
             y = y[:total_len]
 
         return np.clip(y, -1.0, 1.0)
-
-    # ---- сервис для UI ----
-    def available_trigger_labels(self) -> List[Dict[str, str]]:
-        labels = self.yam.available_labels()
-        return [{"id": lab, "label": lab, "ru": _ru_label(lab)} for lab in labels]
-
-    def set_selected_triggers(self, labels: Iterable[str]):
-        self.yam.set_targets(labels)

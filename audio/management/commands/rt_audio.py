@@ -23,7 +23,6 @@ class Command(BaseCommand):
         parser.add_argument("--no-vacuum", action="store_true", help="Disable vacuum")
         parser.add_argument("--no-denoise", action="store_true", help="Disable denoise")
         parser.add_argument("--block", type=int, default=256, help="Block size in stream samples")
-        parser.add_argument("--hard-mute-triggers", action="store_true", help="Hard mute trigger bands (zero-out outside speech)")
 
     def handle(self, *args, **opts):
         if opts["list"]:
@@ -89,7 +88,7 @@ class Command(BaseCommand):
         # Пробуем открыть поток на первом подходящем sr
         for sr in sr_list:
             try:
-                proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=opts["block"], hard_mute_triggers=opts["hard_mute_triggers"])
+                proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=opts["block"])
 
                 def callback(indata, outdata, frames, time_info, status):
                     if status:

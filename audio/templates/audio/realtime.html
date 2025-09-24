@@ -1,260 +1,242 @@
-{% extends "audio/base.html" %}
 {% load static %}
-
-{% block content %}
-<div class="container">
-  <h1>NeuroTone — Real-Time</h1>
-  <p class="sub">Подключите вход/выход, задайте параметры и нажмите <b>Start</b>.</p>
-
-  <div class="card rt-grid">
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>NeuroTone — Real-Time</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="{% static 'audio/styles.css' %}">
+  <style>
+    :root { --bg:#0b1020; --panel:#121a30; --muted:#7a8bb2; --brand:#60a5fa; --ok:#10b981; --err:#ef4444; }
+    body { background: var(--bg); color: #e6ecff; font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+    .wrap { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+    .card { background: var(--panel); border-radius: 16px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+    label { font-size: 13px; color: var(--muted); display:block; margin-bottom:6px; }
+    select, input[type=number], input[type=text] {
+      width:100%; background:#0f1528; color:#e6ecff; border:1px solid #1e2a4a; border-radius:12px; padding:10px 12px; outline:none;
+    }
+    .row { display:flex; gap:12px; align-items:center; }
+    .btn { border:0; border-radius:12px; padding:12px 16px; background: var(--brand); color:#081022; font-weight:600; cursor:pointer; }
+    .btn.ghost { background:#1b284a; color:#cfe1ff; }
+    .btn.stop { background: var(--err); color: #fff; }
+    .kpis { display:grid; grid-template-columns: repeat(4,1fr); gap:10px; margin-top:14px; }
+    .k { background:#0f1528; padding:10px 12px; border-radius:10px; }
+    .k b { display:block; font-size:12px; color:var(--muted); }
+    .k span { font-weight:700; }
+    .switch { display:flex; gap:10px; align-items:center; }
+    .switch input { width:18px; height:18px; }
+    .status-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:8px; background:#6b7280; }
+    .status-dot.on { background: var(--ok); }
+    .status { font-size:13px; color: var(--muted); }
+    .h1 { font-size:28px; font-weight:800; letter-spacing:.2px; margin-bottom:8px; }
+    .muted { color: var(--muted); }
+    .range { width:100%; }
+    .footer { margin-top:22px; font-size:12px; color:#8fa6d8; }
+    .alert { margin-top:12px; background:#2a1020; border:1px solid #5b163e; color:#ffd6e5; padding:10px 12px; border-radius:10px; display:none; }
+    .alert.on { display:block; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between; margin-bottom:14px;">
     <div>
-      <label>Input device (микрофон)</label>
-      <select id="inDev" disabled></select>
+      <div class="h1">NeuroTone — Real-Time</div>
+      <div class="muted">Подключите вход/выход, задайте параметры и нажмите <b>Start</b>.</div>
+    </div>
+    <a href="/" class="btn ghost">← Назад</a>
+  </div>
 
-      <label>Samplerate (опционально)</label>
-      <input id="srInput" type="text" placeholder="пусто = по умолчанию устройства"/>
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>Input device (микрофон)</label>
+        <select id="inDev"></select>
+      </div>
+      <div>
+        <label>Output device (наушники)</label>
+        <select id="outDev"></select>
+      </div>
+      <div>
+        <label>Samplerate (опционально)</label>
+        <input id="sr" type="number" min="8000" step="1000" placeholder="пусто = по умолчанию устройства" />
+      </div>
+      <div>
+        <label>Block size (frames)</label>
+        <input id="block" type="number" min="120" step="60" value="480" />
+      </div>
 
-      <label>Trigger sensitivity</label>
-      <input id="trigRange" type="range" min="0.02" max="0.50" step="0.01" value="0.08">
-      <div class="hint">0.08 (ниже → агрессивнее)</div>
+      <div>
+        <label>Trigger sensitivity</label>
+        <input id="sens" class="range" type="range" min="0.03" max="0.20" step="0.01" value="0.08">
+        <div class="muted"><span id="sensVal">0.08</span> (ниже → агрессивнее)</div>
+      </div>
+      <div>
+        <label>Vacuum strength</label>
+        <input id="vac" class="range" type="range" min="0" max="1" step="0.05" value="1">
+        <div class="muted"><span id="vacVal">1.00</span> (сила приглушения вне речи)</div>
+      </div>
 
-      <label class="check">
-        <input id="protectSpeech" type="checkbox" checked>
-        <span>Protect speech (сохранять чёткость речи)</span>
-      </label>
+      <div class="switch">
+        <input id="protect" type="checkbox" checked>
+        <label for="protect">Protect speech (сохранять чёткость речи)</label>
+      </div>
+      <div class="switch">
+        <input id="triggers" type="checkbox" checked>
+        <label for="triggers">Trigger kill (убирать чавканье/тик-так/клаву)</label>
+      </div>
 
-      <label class="check">
-        <input id="vacuumMode" type="checkbox" checked>
-        <span>Vacuum (вне речи)</span>
-      </label>
+      <div class="switch">
+        <input id="vacuum" type="checkbox" checked>
+        <label for="vacuum">Vacuum (вне речи)</label>
+      </div>
+      <div class="switch">
+        <input id="ultra" type="checkbox" checked>
+        <label for="ultra">Ultra ANC (сильнее приглушение вне речи)</label>
+      </div>
     </div>
 
-    <div>
-      <label>Output device (наушники)</label>
-      <select id="outDev" disabled></select>
-
-      <label>Block size (frames)</label>
-      <input id="blockInput" type="number" min="120" step="60" value="480"/>
-
-      <label>Vacuum strength</label>
-      <input id="vacRange" type="range" min="0.20" max="1.00" step="0.05" value="1.00">
-      <div class="hint">1.00 (сила приглушения вне речи)</div>
-
-      <label class="check">
-        <input id="killTriggers" type="checkbox" checked>
-        <span>Trigger kill (убирать чавканье/тик-так/клаву)</span>
-      </label>
-
-      <label class="check">
-        <input id="ultraAnc" type="checkbox">
-        <span>Ultra ANC (сильнее приглушение вне речи)</span>
-      </label>
+    <div class="row" style="margin-top:16px; gap:10px;">
+      <button class="btn" id="btnStart">Start</button>
+      <button class="btn stop" id="btnStop">Stop</button>
+      <div class="status"><span id="dot" class="status-dot"></span><span id="stxt">stopped</span></div>
     </div>
-  </div>
 
-  <div style="margin-top:14px;display:flex;gap:12px;align-items:center">
-    <button id="chooseTrig" class="btn">Выбрать триггеры…</button>
-    <div>Выбрано: <span id="chosenTrig">—</span></div>
-  </div>
+    <div id="errBox" class="alert"></div>
 
-  <div class="controls">
-    <button id="startBtn" class="btn primary">Start</button>
-    <button id="stopBtn" class="btn danger">Stop</button>
-    <div id="stateDot" class="state stopped">stopped</div>
-  </div>
+    <div class="kpis">
+      <div class="k"><b>Frames</b><span id="k_frames">0</span></div>
+      <div class="k"><b>Samplerate</b><span id="k_sr">—</span></div>
+      <div class="k"><b>Channels</b><span id="k_ch">—</span></div>
+      <div class="k"><b>Block</b><span id="k_block">—</span></div>
+    </div>
 
-  <div id="errBox" class="error" style="display:none"></div>
-
-  <div class="stats">
-    <div class="stat"><b>Frames</b><span id="stFrames">—</span></div>
-    <div class="stat"><b>Samplerate</b><span id="stSR">—</span></div>
-    <div class="stat"><b>Channels</b><span id="stCH">—</span></div>
-    <div class="stat"><b>Block</b><span id="stBL">—</span></div>
+    <div class="footer">Совет: если слышите артефакты по BT-кодеку — протестируйте с проводными наушниками для эталона качества алгоритма.</div>
   </div>
 </div>
 
-<!-- Крошечные стили для доступности -->
-<style>
-  .rt-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-  label{display:block;margin:12px 0 6px}
-  select, input[type="text"], input[type="number"]{width:100%;height:40px;background:#0e1729;border:1px solid #223252;color:#e8eeff;border-radius:10px;padding:0 12px}
-  input[type="range"]{width:100%}
-  .hint{opacity:.6;font-size:.9rem;margin-top:2px}
-  .check{display:flex;gap:8px;align-items:center;margin:10px 0}
-  .controls{display:flex;gap:10px;align-items:center;margin-top:14px}
-  .btn{height:40px;padding:0 16px;border-radius:10px;background:#1a2846;border:1px solid #2a3b5f;color:#e8eeff}
-  .btn.primary{background:#2563eb;border-color:#2563eb}
-  .btn.danger{background:#ef4444;border-color:#ef4444}
-  .state{margin-left:8px;opacity:.8}
-  .state.running{color:#34d399}
-  .state.stopped{color:#ef4444}
-  .error{margin-top:12px;padding:12px;border-radius:10px;background:#401a1f;border:1px solid #7a2d36;color:#ffd6d9}
-  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}
-  .stat{background:#0e1729;border:1px solid #223252;border-radius:10px;padding:10px 12px}
-  .stat b{display:block;opacity:.7;margin-bottom:4px}
-</style>
-
 <script>
-(function(){
-  const inSel   = document.getElementById('inDev');
-  const outSel  = document.getElementById('outDev');
-  const srInput = document.getElementById('srInput');
-  const blockIn = document.getElementById('blockInput');
-  const trigR   = document.getElementById('trigRange');
-  const vacR    = document.getElementById('vacRange');
-  const protect = document.getElementById('protectSpeech');
-  const vacuumM = document.getElementById('vacuumMode');
-  const killT   = document.getElementById('killTriggers');
-  const ultra   = document.getElementById('ultraAnc');
-
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn  = document.getElementById('stopBtn');
-  const errBox   = document.getElementById('errBox');
-  const stateDot = document.getElementById('stateDot');
-
-  const stFrames = document.getElementById('stFrames');
-  const stSR     = document.getElementById('stSR');
-  const stCH     = document.getElementById('stCH');
-  const stBL     = document.getElementById('stBL');
-
-  const chosenUI = document.getElementById('chosenTrig');
-  const chooseBtn= document.getElementById('chooseTrig');
-  let chosenTriggers = [];
-
+  const el = id => document.getElementById(id);
+  function fmt(v, d=2){ return Number(v).toFixed(d); }
   function showErr(msg){
-    errBox.style.display = 'block';
-    errBox.textContent = 'Ошибка: ' + msg;
-  }
-  function clearErr(){
-    errBox.style.display = 'none';
-    errBox.textContent = '';
-  }
-  function setRunning(r){
-    stateDot.textContent = r ? 'running' : 'stopped';
-    stateDot.classList.toggle('running', r);
-    stateDot.classList.toggle('stopped', !r);
+    const b = el('errBox');
+    if(msg){ b.textContent = 'Ошибка: ' + msg; b.classList.add('on'); }
+    else { b.textContent = ''; b.classList.remove('on'); }
   }
 
-  async function postJSON(url, data) {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-      credentials: 'same-origin',
-    });
-    const ct = res.headers.get('content-type') || '';
-    if (ct.includes('application/json')) {
-      return await res.json();
-    } else {
-      const text = await res.text();
-      throw new Error(text);
+  async function api(path, opts={}){
+    const r = await fetch(path, Object.assign({
+      headers: {'Content-Type':'application/json'},
+      credentials:'same-origin'
+    }, opts));
+    let data = null;
+    try { data = await r.json(); } catch(e) {
+      throw new Error('Некорректный ответ сервера ('+r.status+')');
     }
+    if(!r.ok){
+      const msg = (data && (data.error || data.detail)) ? (data.error || data.detail) : ('HTTP '+r.status);
+      throw new Error(msg);
+    }
+    return data;
   }
 
   async function loadDevices(){
-    clearErr();
-    inSel.innerHTML = '<option>Загрузка…</option>';
-    outSel.innerHTML = '<option>Загрузка…</option>';
-    const {ok, data} = await api('/rt/devices');
-    if(!ok){
-      inSel.innerHTML = '';
-      outSel.innerHTML = '';
-      showErr(data.error || 'Не удалось получить список устройств');
-      return;
-    }
-    // Заполняем список
-    inSel.innerHTML = '';
-    (data.inputs||[]).forEach(d=>{
-      const o = document.createElement('option');
-      o.value = String(d.index);
-      o.textContent = d.label;
-      inSel.appendChild(o);
-    });
-    outSel.innerHTML = '';
-    (data.outputs||[]).forEach(d=>{
-      const o = document.createElement('option');
-      o.value = String(d.index);
-      o.textContent = d.label;
-      outSel.appendChild(o);
-    });
-
-    inSel.disabled = (inSel.options.length===0);
-    outSel.disabled = (outSel.options.length===0);
-
-    if(data.default_in != null)  inSel.value  = String(data.default_in);
-    if(data.default_out != null) outSel.value = String(data.default_out);
-
-    if(inSel.options.length===0 || outSel.options.length===0){
-      showErr('Не найдено подходящих аудио-устройств. Откройте «Звук → Вход/Выход» в Windows и убедитесь, что микрофон/наушники активны.');
+    try{
+      const data = await api('/rt/api/devices/');
+      const inSel = el('inDev'), outSel = el('outDev');
+      inSel.innerHTML = ''; outSel.innerHTML = '';
+      data.devices.forEach(d=>{
+        if(d.max_input_channels>0){
+          const iopt = document.createElement('option');
+          iopt.value = d.id; iopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (in:${d.max_input_channels})`;
+          if(d.id === data.default_input) iopt.selected = true;
+          inSel.appendChild(iopt);
+        }
+        if(d.max_output_channels>0){
+          const oopt = document.createElement('option');
+          oopt.value = d.id; oopt.textContent = `[${d.id}] ${d.name} — ${d.hostapi} (out:${d.max_output_channels})`;
+          if(d.id === data.default_output) oopt.selected = true;
+          outSel.appendChild(oopt);
+        }
+      });
+    }catch(e){
+      showErr(e.message);
     }
   }
 
-  async function loadTriggers(){
-    const {ok, data} = await api('/rt/triggers');
-    if(!ok){ return; }
-    const items = data.items || [];
-    // диалог выбора (минималистичный prompt)
-    chooseBtn.onclick = ()=>{
-      const list = items.map((t,i)=>`${i+1}. ${t}`).join('\n');
-      const ans = prompt('Введите номера триггеров через запятую:\n\n'+list+'\n\nПример: 1,4,7');
-      if(!ans) return;
-      const pick = ans.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n) && n>=1 && n<=items.length);
-      chosenTriggers = Array.from(new Set(pick.map(n=>items[n-1])));
-      chosenUI.textContent = chosenTriggers.length ? chosenTriggers.join(', ') : '—';
-    };
-  }
-
-  async function start(){
-    clearErr();
-    if(inSel.disabled || outSel.disabled){
-      showErr('Список устройств пуст. Нажмите F5 для повторной загрузки / или проверьте подключение устройств.');
-      return;
-    }
+  async function startRT(){
+    showErr('');
     const payload = {
-      in:  parseInt(inSel.value,10),
-      out: parseInt(outSel.value,10),
-      sr:  srInput.value ? parseInt(srInput.value,10) : null,
-      block: parseInt(blockIn.value || '480',10),
-      sensitivity: parseFloat(trigR.value),
-      vacuum_strength: parseFloat(vacR.value),
-      protect_speech: protect.checked,
-      trigger_kill:   killT.checked,
-      ultra_anc:      ultra.checked,
-      triggers:       chosenTriggers
+      input_id: Number(el('inDev').value),
+      output_id: Number(el('outDev').value),
+      sensitivity: Number(el('sens').value),
+      vacuum: Number(el('vac').value),
+      block: Number(el('block').value),
+      protect_speech: el('protect').checked,
+      enable_triggers: el('triggers').checked,
+      enable_vacuum: el('vacuum').checked,
+      ultra_anc: el('ultra').checked,
     };
-    const {ok, data} = await api('/rt/start', {method:'POST', body: JSON.stringify(payload)});
-    if(!ok){ showErr(data.error || 'Не удалось запустить поток'); setRunning(false); return; }
-    stSR.textContent = data.sr || '—';
-    stBL.textContent = data.block || '—';
-    stCH.textContent = data.channels || '—';
-    stFrames.textContent = '0';
-    setRunning(true);
+    const sr = Number(el('sr').value);
+    if(sr > 0) payload.samplerate = sr;
+
+    try{
+      const res = await api('/rt/api/start/', {method:'POST', body: JSON.stringify(payload)});
+      updateStatus(res);
+    }catch(e){
+      showErr(e.message);
+      // запрашиваем статус, вдруг что-то успело запуститься
+      try{ updateStatus(await api('/rt/api/status/')); }catch(_){}
+    }
   }
 
-  async function stop(){
-    clearErr();
-    await api('/rt/stop', {method:'POST', body:'{}'});
-    setRunning(false);
+  async function stopRT(){
+    showErr('');
+    try{
+      const res = await api('/rt/api/stop/', {method:'POST', body: '{}'});
+      updateStatus(res);
+    }catch(e){
+      showErr(e.message);
+    }
+  }
+
+  function updateStatus(s){
+    const on = !!s.running;
+    el('dot').className = 'status-dot' + (on ? ' on' : '');
+    el('stxt').textContent = on ? 'running' : 'stopped';
+    el('k_frames').textContent = s.frames ?? 0;
+    if(s.params){
+      el('k_sr').textContent = s.params.samplerate ?? '—';
+      el('k_ch').textContent = s.params.channels ?? '—';
+      el('k_block').textContent = s.params.block ?? '—';
+    } else {
+      el('k_sr').textContent = '—';
+      el('k_ch').textContent = '—';
+      el('k_block').textContent = '—';
+    }
+    if(s.last_error){
+      showErr(s.last_error);
+      console.warn('RT last_error:', s.last_error);
+    }
   }
 
   async function poll(){
-    const {ok, data} = await api('/rt/stats');
-    if(ok){
-      stFrames.textContent = data.frames != null ? String(data.frames) : '—';
-      stSR.textContent     = data.samplerate || '—';
-      stCH.textContent     = data.channels || '—';
-      stBL.textContent     = data.block || '—';
-      if(data.last_error){ showErr(data.last_error); }
-      setRunning(!!data.running);
+    try {
+      const s = await api('/rt/api/status/');
+      updateStatus(s);
+    } catch(e) {
+      // молча, чтобы не спамить
     }
+    setTimeout(poll, 1000);
   }
 
-  // init
+  el('sens').addEventListener('input', e=> el('sensVal').textContent = fmt(e.target.value, 2));
+  el('vac').addEventListener('input', e=> el('vacVal').textContent = fmt(e.target.value, 2));
+  el('btnStart').addEventListener('click', startRT);
+  el('btnStop').addEventListener('click', stopRT);
+
   loadDevices();
-  loadTriggers();
-  startBtn.onclick = start;
-  stopBtn.onclick = stop;
-  setInterval(poll, 800);
-})();
+  poll();
 </script>
-{% endblock %}
+</body>
+</html>
