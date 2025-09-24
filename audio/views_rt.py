@@ -1,72 +1,107 @@
-# audio/views_rt.py
-# Веб-ручки для страницы /rt/: устройства, старт/стоп, список триггеров.
-
 import json
-from typing import Any, Dict, List
-
 from django.http import JsonResponse, HttpRequest
 from django.shortcuts import render
+from django.views.decorators.http import require_GET, require_POST
 from django.views.decorators.csrf import csrf_exempt
 
-import sounddevice as sd
+# ВАЖНО: импортируем ИМЕННО объект-синглтон, а не модуль
+from .rt_manager import rt_manager
 
-from . import rt_manager
 
-
+# ---------- PAGE ----------
+@require_GET
 def rt_page(request: HttpRequest):
     return render(request, "audio/realtime.html")
 
 
+# ---------- API: devices ----------
+@require_GET
 def list_devices(request: HttpRequest):
-    devs = sd.query_devices()
-    # строим красивый список
-    items = []
-    for idx, d in enumerate(devs):
-        in_ch = int(d.get("max_input_channels", 0))
-        out_ch = int(d.get("max_output_channels", 0))
-        host = d.get("hostapi", 0)
-        host_name = sd.query_hostapis()[host]["name"] if isinstance(host, int) else str(host)
-        name = f"[{idx}] {d['name']} — {host_name} (in:{in_ch}, out:{out_ch})"
-        items.append({
-            "index": idx,
-            "name": name,
-            "in": in_ch,
-            "out": out_ch,
-            "default_samplerate": d.get("default_samplerate"),
-        })
-    return JsonResponse({"ok": True, "items": items})
+    try:
+        return JsonResponse(rt_manager.list_devices())
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
+# ---------- API: triggers (каталог) ----------
+@require_GET
 def list_triggers(request: HttpRequest):
-    data = rt_manager.available_triggers()
-    # добавим плоский список только названий (ru) для быстрого поиска
-    simple = [it.get("ru") or it.get("label") for it in data.get("items", [])]
-    data["names"] = simple
-    return JsonResponse(data)
+    """
+    Возвращаем список доступных триггеров для UI.
+    Если в realtime.py есть локализованный список — используем его,
+    иначе выдаём безопасный короткий набор по умолчанию.
+    """
+    try:
+        try:
+            from .realtime import TRIGGER_LABELS_RU  # если есть
+            items = TRIGGER_LABELS_RU
+        except Exception:
+            items = [
+                "чавканье", "тик-так часов", "клавиатурные клики",
+                "стук", "сирена", "собака", "крик"
+            ]
+        return JsonResponse({"ok": True, "items": items})
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
+# ---------- API: start ----------
 @csrf_exempt
+@require_POST
 def start_rt(request: HttpRequest):
     try:
-        if request.method != "POST":
-            return JsonResponse({"ok": False, "error": "POST only"}, status=405)
-        body = request.body.decode("utf-8") or "{}"
-        params: Dict[str, Any] = json.loads(body)
+        data = json.loads(request.body.decode("utf-8"))
 
-        res = rt_manager.start(params)
-        return JsonResponse({"ok": True, **res})
+        in_idx = int(data["in"])
+        out_idx = int(data["out"])
+
+        # optional
+        sr = data.get("sr")
+        sr = int(sr) if sr not in (None, "", 0, "0") else None
+
+        block = data.get("block")
+        block = int(block) if block not in (None, "", 0, "0") else None
+
+        channels = data.get("channels")
+        channels = int(channels) if channels not in (None, "", 0, "0") else None
+
+        # Конфиг для RT-процессора (имена ключей совпадают с RTConfig)
+        cfg = {
+            "trigger_threshold": float(data.get("trig_thresh", 0.10)),
+            "vacuum_strength": float(data.get("vacuum", 1.0)),
+            "protect_speech": bool(data.get("protect", True)),
+            "trigger_kill": bool(data.get("trigger_kill", True)),
+            "ultra_anc": bool(data.get("ultra_anc", False)),
+            "selected_triggers": data.get("triggers", []),
+        }
+
+        res = rt_manager.start(
+            in_index=in_idx,
+            out_index=out_idx,
+            samplerate=sr,
+            blocksize=block,
+            channels=channels,
+            cfg_dict=cfg,
+        )
+        return JsonResponse(res)
     except Exception as e:
-        return JsonResponse({"ok": False, "error": str(e)})
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
+# ---------- API: stop ----------
 @csrf_exempt
+@require_POST
 def stop_rt(request: HttpRequest):
     try:
-        res = rt_manager.stop()
-        return JsonResponse({"ok": True, **res})
+        return JsonResponse(rt_manager.stop())
     except Exception as e:
-        return JsonResponse({"ok": False, "error": str(e)})
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
 
 
+# ---------- API: stats ----------
+@require_GET
 def rt_stats(request: HttpRequest):
-    return JsonResponse({"ok": True, **rt_manager.stats()})
+    try:
+        return JsonResponse(rt_manager.stats())
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)}, status=500)
