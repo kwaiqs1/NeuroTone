@@ -1,195 +1,192 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List
+import threading
+from typing import Any, Dict, List, Optional
 
-import numpy as np
 import sounddevice as sd
 
-from .realtime import RealTimeProcessor, RTConfig
+# Реальный DSP/ИИ-процессор и его конфиг
+try:
+    from .realtime import RealTimeProcessor, RTConfig as _RTConfig
+except Exception as e:  # fall back, чтобы страница не падала при импорт-ошибках
+    RealTimeProcessor = None  # type: ignore
+    _RTConfig = None          # type: ignore
+    _import_error = e
+else:
+    _import_error = None
 
-# Безопасные значения по умолчанию
-DEFAULT_SR_CANDIDATES = [48000, 44100]
-DEFAULT_BLOCK = 480
-DEFAULT_CHANNELS = 1  # см. комментарий в start(): один канал для duplex Stream
+
+# Безопасная обёртка вокруг RTConfig: принимаем «алиасы» полей
+def _make_rt_config(cfg: Dict[str, Any]) -> Any:
+    """
+    Приводим входные параметры к тем, что реально есть у RTConfig в realtime.py.
+    Поддерживаем алиасы: 'trigger_threshold' -> 'sensitivity' и т.п.
+    """
+    if _RTConfig is None:
+        raise RuntimeError(f"Realtime engine is not available: {_import_error}")
+
+    # алиасы/значения по умолчанию
+    in_index = int(cfg.get("in"))
+    out_index = int(cfg.get("out"))
+    samplerate = cfg.get("sr")
+    samplerate = int(samplerate) if samplerate not in (None, "", "null") else None
+    block = int(cfg.get("block", 480))
+
+    # ключ чувствительности — фронт шлёт 'sensitivity'; старые версии могли слать 'trigger_threshold'
+    sensitivity = cfg.get("sensitivity", cfg.get("trigger_threshold", 0.08))
+    sensitivity = float(sensitivity)
+
+    vacuum_strength = float(cfg.get("vacuum_strength", 1.0))
+    protect_speech = bool(cfg.get("protect_speech", True))
+    trigger_kill = bool(cfg.get("trigger_kill", True))
+    ultra_anc = bool(cfg.get("ultra_anc", False))
+    triggers = cfg.get("triggers") or []
+    if not isinstance(triggers, list):
+        triggers = [triggers]
+
+    # Конструируем тот же RTConfig, что ожидает движок
+    return _RTConfig(
+        in_index=in_index,
+        out_index=out_index,
+        samplerate=samplerate,
+        block=block,
+        sensitivity=sensitivity,
+        vacuum_strength=vacuum_strength,
+        protect_speech=protect_speech,
+        trigger_kill=trigger_kill,
+        ultra_anc=ultra_anc,
+        triggers=triggers,
+    )
 
 
-def _hostapis() -> List[str]:
+# Глобальное состояние одного RT-потока
+_lock = threading.Lock()
+_rt = None        # type: Optional[RealTimeProcessor]
+_last_error = ""
+_stats: Dict[str, Any] = {
+    "running": False,
+    "frames": 0,
+    "samplerate": None,
+    "channels": None,
+    "block": None,
+    "last_error": "",
+}
+
+
+def _set_error(msg: str) -> None:
+    global _last_error, _stats
+    _last_error = msg
+    _stats["last_error"] = msg
+
+
+def list_devices() -> Dict[str, Any]:
+    """Вернёт входы/выходы и дефолтные индексы для UI."""
     try:
-        ha = sd.query_hostapis()
-        return [h.get("name", f"hostapi#{i}") for i, h in enumerate(ha)]
-    except Exception:
-        return []
+        devices = sd.query_devices()
+        default_in, default_out = sd.default.device
+    except Exception as e:
+        return {"ok": False, "error": str(e), "inputs": [], "outputs": []}
+
+    inputs, outputs = [], []
+    for i, d in enumerate(devices):
+        label = f"[{i}] {d['name']} — {d['hostapi']}" if "hostapi" in d else f"[{i}] {d['name']}"
+        if int(d.get("max_input_channels", 0)) > 0:
+            inputs.append({"index": i, "label": label})
+        if int(d.get("max_output_channels", 0)) > 0:
+            outputs.append({"index": i, "label": label})
+
+    return {
+        "ok": True,
+        "inputs": inputs,
+        "outputs": outputs,
+        "default_in": default_in if isinstance(default_in, int) else None,
+        "default_out": default_out if isinstance(default_out, int) else None,
+    }
 
 
-def _fmt_label(idx: int, dev: Dict[str, Any], hostapis_names: List[str]) -> str:
-    h = hostapis_names[dev.get("hostapi", 0)] if hostapis_names else ""
-    ins, outs = int(dev.get("max_input_channels", 0)), int(dev.get("max_output_channels", 0))
-    name = dev.get("name", f"device#{idx}")
-    tail = f"(in:{ins}, out:{outs})"
-    hstr = f" — {h}" if h else ""
-    return f"[{idx}] {name}{hstr} {tail}"
+# Небольшая библиотека «триггеров» (рус)
+try:
+    # если в realtime.py уже есть словарь с русским списком — используем его
+    from .realtime import TRIGGER_LIBRARY_RU as _TRIGS  # type: ignore
+    TRIGGERS_RU = list(_TRIGS)
+except Exception:
+    TRIGGERS_RU = [
+        "чавканье", "тик-так", "стук", "крик", "печать на клавиатуре",
+        "скрип", "звон посуды", "шёпот", "кашель", "чих", "свист", "хлопок",
+        "шорох пакета", "лай собаки", "смех",
+    ]
 
 
-@dataclass
-class _State:
-    stream: Optional[sd.Stream] = None
-    proc: Optional[RealTimeProcessor] = None
-    frames: int = 0
-    running: bool = False
-    sr: Optional[int] = None
-    block: Optional[int] = None
-    channels: Optional[int] = None
-    last_error: Optional[str] = None
-    started_at: Optional[float] = None
+def trigger_list() -> Dict[str, Any]:
+    return {"ok": True, "items": TRIGGERS_RU}
 
 
-class RTManager:
-    def __init__(self) -> None:
-        self.s = _State()
-
-    # ---------- devices ----------
-    def list_devices(self) -> Dict[str, Any]:
-        try:
-            devs = sd.query_devices()
-            hostapis_names = _hostapis()
-
-            inputs, outputs = [], []
-            for i, d in enumerate(devs):
-                lab = _fmt_label(i, d, hostapis_names)
-                if int(d.get("max_input_channels", 0)) > 0:
-                    inputs.append({"index": i, "label": lab})
-                if int(d.get("max_output_channels", 0)) > 0:
-                    outputs.append({"index": i, "label": lab})
-
-            di, do = sd.default.device
-            return {
-                "ok": True,
-                "inputs": inputs,
-                "outputs": outputs,
-                "default_in": int(di) if di is not None else (inputs[0]["index"] if inputs else None),
-                "default_out": int(do) if do is not None else (outputs[0]["index"] if outputs else None),
-            }
-        except Exception as e:
-            return {"ok": False, "error": f"list_devices: {e}"}
-
-    # ---------- start/stop ----------
-    def start(
-        self,
-        in_index: int,
-        out_index: int,
-        samplerate: Optional[int] = None,
-        blocksize: Optional[int] = None,
-        channels: Optional[int] = None,
-        cfg_dict: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        # аккуратно останавливаем, если уже запущено
-        if self.s.stream is not None:
-            self.stop()
-
-        # резолвим параметры
-        sr = int(samplerate) if samplerate else None
-        if sr is None:
-            # пробуем взять дефолт устройства, если не подходит — fallback
+def start(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Стартуем один RT-процессор (если есть старый — останавливаем)."""
+    global _rt, _stats
+    with _lock:
+        _set_error("")
+        # останавливаем прежний
+        if _rt is not None:
             try:
-                idef = sd.query_devices(in_index).get("default_samplerate")
-                odef = sd.query_devices(out_index).get("default_samplerate")
-                cand = [int(idef) if idef else None, int(odef) if odef else None]
-                sr = next((c for c in cand if c), None)
+                _rt.stop()
             except Exception:
-                sr = None
-        if sr is None:
-            for c in DEFAULT_SR_CANDIDATES:
-                sr = c
-                break
-
-        block = int(blocksize) if blocksize else DEFAULT_BLOCK
-        ch = int(channels) if channels else DEFAULT_CHANNELS  # duplex Stream требует одинаковые in/out
-
-        # конфиг realtime процессора
-        cfg = RTConfig(
-            trigger_threshold=float(cfg_dict.get("trigger_threshold", 0.10)) if cfg_dict else 0.10,
-            vacuum_strength=float(cfg_dict.get("vacuum_strength", 1.0)) if cfg_dict else 1.0,
-            protect_speech=bool(cfg_dict.get("protect_speech", True)) if cfg_dict else True,
-            trigger_kill=bool(cfg_dict.get("trigger_kill", True)) if cfg_dict else True,
-            ultra_anc=bool(cfg_dict.get("ultra_anc", False)) if cfg_dict else False,
-            selected_triggers=cfg_dict.get("selected_triggers", []) if cfg_dict else [],
-        )
-        proc = RealTimeProcessor(cfg)
-
-        def _cb(indata, outdata, frames, time_info, status):
-            if status:
-                # просто пишем статус в лог статистики, не валим поток
-                self.s.last_error = str(status)
-            try:
-                # indata/outdata shape: (frames, ch)
-                mono_in = indata[:, 0] if indata.ndim == 2 else indata
-                mono_out = proc.process_block(mono_in.astype(np.float32, copy=False))
-                if mono_out.ndim == 1:
-                    mono_out = mono_out.reshape(-1, 1)
-                # дублируем на все каналы (их ch одинаково для in/out)
-                if mono_out.shape[1] < ch:
-                    mono_out = np.repeat(mono_out, ch, axis=1)
-                outdata[:] = mono_out[:frames, :ch]
-                self.s.frames += int(frames)
-            except Exception as e:
-                self.s.last_error = f"callback: {e}"
-
-        # создаём duplex stream (одинаковые channels для in/out)
+                pass
+            _rt = None
+        # создаём новый
         try:
-            stream = sd.Stream(
-                samplerate=sr,
-                blocksize=block,
-                device=(in_index, out_index),
-                dtype="float32",
-                channels=ch,
-                callback=_cb,
-            )
-            stream.start()
-
-            self.s = _State(
-                stream=stream,
-                proc=proc,
-                frames=0,
-                running=True,
-                sr=sr,
-                block=block,
-                channels=ch,
-                last_error=None,
-                started_at=time.time(),
-            )
-            return {"ok": True, "sr": sr, "block": block, "channels": ch}
+            rt_cfg = _make_rt_config(cfg)
+            if RealTimeProcessor is None:
+                raise RuntimeError(f"Realtime engine is not available: {_import_error}")
+            _rt = RealTimeProcessor(rt_cfg)
+            _rt.start()
         except Exception as e:
-            self.s.last_error = str(e)
-            return {"ok": False, "error": f"start: {e}"}
+            _set_error(str(e))
+            return {"ok": False, "error": str(e)}
 
-    def stop(self) -> Dict[str, Any]:
+        # обновляем статусы
         try:
-            if self.s.stream is not None:
-                try:
-                    self.s.stream.stop()
-                finally:
-                    self.s.stream.close()
-            self.s = _State()
-            return {"ok": True}
-        except Exception as e:
-            self.s.last_error = str(e)
-            return {"ok": False, "error": f"stop: {e}"}
+            _stats.update({
+                "running": True,
+                "frames": 0,
+                "samplerate": getattr(_rt, "sr", getattr(_rt, "samplerate", None)),
+                "channels": getattr(_rt, "channels", 1),
+                "block": getattr(_rt, "block", cfg.get("block", 480)),
+                "last_error": "",
+            })
+        except Exception:
+            pass
 
-    def stats(self) -> Dict[str, Any]:
         return {
             "ok": True,
-            "running": self.s.running,
-            "frames": self.s.frames,
-            "samplerate": self.s.sr,
-            "block": self.s.block,
-            "channels": self.s.channels,
-            "last_error": self.s.last_error,
-            "uptime_sec": (time.time() - self.s.started_at) if (self.s.running and self.s.started_at) else 0.0,
+            "sr": _stats["samplerate"],
+            "channels": _stats["channels"],
+            "block": _stats["block"],
         }
 
 
-# Синглтон на модуль
-rt_manager = RTManager()
+def stop() -> Dict[str, Any]:
+    global _rt, _stats
+    with _lock:
+        if _rt is not None:
+            try:
+                _rt.stop()
+            except Exception as e:
+                _set_error(str(e))
+            _rt = None
+        _stats["running"] = False
+    return {"ok": True}
+
+
+def stats() -> Dict[str, Any]:
+    """Немного статистики для UI."""
+    global _rt, _stats
+    with _lock:
+        # аккуратно читаем счётчик кадров, если движок его ведёт
+        try:
+            if _rt is not None and hasattr(_rt, "frames_processed"):
+                _stats["frames"] = int(getattr(_rt, "frames_processed"))
+        except Exception:
+            pass
+        return dict(_stats)
