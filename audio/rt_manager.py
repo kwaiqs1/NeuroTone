@@ -1,10 +1,4 @@
 # audio/rt_manager.py
-# Надёжный запуск real-time под Windows:
-#  - сперва без extra_settings (совместимо как CLI),
-#  - затем WASAPI shared (если доступен),
-#  - при неудаче авто-переключение на DirectSound,
-#  - безопасный внутренний blocksize для DSP (без деления на 0),
-#  - финальный fallback как в CLI.
 
 import threading
 import time
@@ -36,7 +30,7 @@ class RTSessionManager:
                 cls._instance = RTSessionManager()
         return cls._instance
 
-    # ---------- devices ----------
+
     @staticmethod
     def list_devices() -> Dict[str, Any]:
         devs = sd.query_devices()
@@ -60,7 +54,7 @@ class RTSessionManager:
             })
         return {"devices": out, "default_input": sd.default.device[0], "default_output": sd.default.device[1]}
 
-    # ---------- helpers ----------
+
     @staticmethod
     def _host_name_of(device_id: int) -> str:
         api_idx = sd.query_devices(device_id).get("hostapi", 0)
@@ -78,7 +72,6 @@ class RTSessionManager:
 
     @staticmethod
     def _find_alt_device(name_sub: str, want_output: bool, host_key: str) -> Optional[int]:
-        """Находит устройство с тем же именем (или его частью) в другом Host API, например DirectSound."""
         name_sub = (name_sub or "").lower()
         devs = sd.query_devices()
         hostapis = sd.query_hostapis()
@@ -116,14 +109,14 @@ class RTSessionManager:
     def _candidate_channel_pairs(self, in_max: int, out_max: int) -> List[Tuple[int, int]]:
         pairs: List[Tuple[int, int]] = []
         if in_max >= 1 and out_max >= 1:
-            pairs.append((1, 1))        # максимально совместимо
+            pairs.append((1, 1))
         if in_max >= 1 and out_max >= 2:
             pairs.append((1, 2))
         if in_max >= 2 and out_max >= 2:
             pairs.append((2, 2))
         if in_max >= 2 and out_max >= 1:
             pairs.append((2, 1))
-        # уникализируем
+
         seen = set(); out = []
         for p in pairs:
             if p not in seen:
@@ -137,11 +130,10 @@ class RTSessionManager:
                       sr_list: List[int],
                       want_block: int,
                       allow_wasapi_shared: bool) -> Optional[Tuple[int, Tuple[int,int], int, Tuple[str,str], Optional[tuple]]]:
-        """Пробует открыть поток: сначала без extra_settings, затем (опц.) WASAPI shared."""
         blocks = [0, int(want_block), 960, 1024, 2048, 512, 256]
         dtype_pairs = [("float32", "float32"), ("int16", "int16")]
 
-        # порядок extra_settings: сначала None (как CLI), потом WASAPI shared при желании
+
         extras: List[Optional[tuple]] = [None]
         if allow_wasapi_shared:
             ex_in = self._mk_wasapi_shared(input_id)
@@ -191,13 +183,13 @@ class RTSessionManager:
         )
         sr_list = self._candidate_samplerates(indev, outdev, user_sr)
 
-        # 1) как CLI / без extra_settings; 2) (опц.) wasapi shared
+
         res = self._attempt_open(input_id, output_id, ch_pairs, sr_list, want_block,
                                  allow_wasapi_shared=True)
         if res:
             return res
 
-        # 3) Авто-переключение на DirectSound, если сейчас WASAPI
+
         in_name = (indev.get("name") or "")
         out_name = (outdev.get("name") or "")
         need_alt = self._is_host(input_id, "wasapi") or self._is_host(output_id, "wasapi")
@@ -205,16 +197,14 @@ class RTSessionManager:
             alt_in = self._find_alt_device(in_name, want_output=False, host_key="DirectSound")
             alt_out = self._find_alt_device(out_name, want_output=True, host_key="DirectSound")
             if alt_in is not None and alt_out is not None:
-                res = self._attempt_open(alt_in, alt_out, ch_pairs, sr_list, want_block,
-                                         allow_wasapi_shared=False)  # для DS extra_settings не нужны
+                res = self._attempt_open(alt_in, alt_out, ch_pairs, sr_list, want_block, allow_wasapi_shared=False)
                 if res:
-                    # сообщим в статусе, что подменили устройства
                     self._params["auto_switched_to_directsound"] = True
                     self._params["input_id_switched"] = alt_in
                     self._params["output_id_switched"] = alt_out
                     return res
 
-        # 4) Резерв: как CLI (mono, float32, blocksize=0, без extra_settings)
+
         try:
             sr_cli = int(user_sr or outdev.get("default_samplerate") or 48000)
 
@@ -231,7 +221,7 @@ class RTSessionManager:
         except Exception as e:
             raise RuntimeError(f"Не удалось открыть аудиопоток: {e}")
 
-    # ---------- control ----------
+
     def start(self,
               input_id: int,
               output_id: int,
@@ -246,7 +236,7 @@ class RTSessionManager:
 
         self.stop()
 
-        # может заполняться в _pick_working_combo при авто-переключении
+
         self._params = {}
 
         sr, (in_ch, out_ch), bs, (dt_in, dt_out), extra = self._pick_working_combo(
@@ -254,7 +244,7 @@ class RTSessionManager:
             want_block=block, user_sr=samplerate
         )
 
-        # внутренний блок для DSP (если драйвер дал bs=0 — берём 20мс, минимум 240)
+
         proc_block = int(sr * 0.02) if bs == 0 else int(bs)
         if proc_block < 240:
             proc_block = 240
@@ -291,7 +281,6 @@ class RTSessionManager:
                 if status:
                     self._status["callback_status"] = str(status)
 
-                # вход -> моно на обработку
                 if indata.ndim == 2 and indata.shape[1] > 1:
                     x = indata[:, :2].mean(axis=1).astype(np.float32)
                 else:
@@ -299,7 +288,6 @@ class RTSessionManager:
 
                 y = proc.process_block(x)
 
-                # выравниваем длину
                 if len(y) < frames:
                     buf = np.zeros(frames, dtype=np.float32); buf[:len(y)] = y; y = buf
                 elif len(y) > frames:
@@ -321,13 +309,13 @@ class RTSessionManager:
                 kwargs = dict(
                     device=(input_id, output_id),
                     samplerate=sr,
-                    blocksize=bs,          # драйверу можно 0
+                    blocksize=bs,
                     channels=(in_ch, out_ch),
                     dtype=(dt_in, dt_out),
                     callback=_cb,
                 )
                 if extra is not None:
-                    kwargs["extra_settings"] = extra  # только wasapi-shared
+                    kwargs["extra_settings"] = extra
                 with sd.Stream(**kwargs) as st:
                     self._stream = st
                     while self._running:

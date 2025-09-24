@@ -3,4 +3,3 @@ html, body { margin:0; padding:0; }
 .container { max-width: 980px; margin: 20px auto; padding: 0 16px; }
 a.btn-link { display:inline-block; padding:10px 14px; border-radius:10px; background:#142042; color:#cfe1ff; text-decoration:none; }
 a.btn-link:hover { background:#1b284a; }
-/* ваши старые стили страниц загрузки тоже можно оставить ниже */

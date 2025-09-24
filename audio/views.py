@@ -27,11 +27,10 @@ def upload_and_process(request):
 
 
     f = request.FILES['audio']
-    # Save original
     item = AudioUpload.objects.create(original_file=f)
 
 
-# Prepare output path
+
     in_path = item.original_file.path
     out_rel = os.path.join('processed', f'processed_{item.pk}.wav')
     out_abs = os.path.join(settings.MEDIA_ROOT, out_rel)
@@ -42,14 +41,13 @@ def upload_and_process(request):
 
     ts = form.cleaned_data.get('trigger_sensitivity')
     if ts in (None, ''):
-        ts = 0.15  # дефолт агрессивности
+        ts = 0.15
 
     vs = form.cleaned_data.get('vacuum_strength')
     if vs in (None, ''):
-        vs = 0.8  # дефолт силы "вакуума"
+        vs = 0.8
 
 
-    # Run pipeline
     cfg = PipelineConfig(
         base_denoise=form.cleaned_data.get('apply_base_denoise', True),
         suppress_triggers=form.cleaned_data.get('suppress_triggers', True),
@@ -63,7 +61,6 @@ def upload_and_process(request):
     try:
         pipeline = get_pipeline()
         info = pipeline.process_file(in_path, out_abs, config=cfg)
-        # Attach processed file to model
         with open(out_abs, 'rb') as fh:
             item.processed_file.save(os.path.basename(out_abs), fh, save=True)
         item.notes = (

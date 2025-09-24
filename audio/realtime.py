@@ -1,6 +1,4 @@
 # audio/realtime.py
-# Реал-тайм: улучшенное качество (OLA с sqrt-Hann, сглаживание маски),
-# более сильный, но стабильный шумодав. Триггеры — из предыдущей версии.
 
 from __future__ import annotations
 import math
@@ -11,7 +9,7 @@ from typing import Optional, Dict
 import numpy as np
 from scipy.signal import butter, sosfilt
 
-# YAMNet (опционально)
+
 try:
     import tensorflow as tf
     import tensorflow_hub as hub
@@ -44,12 +42,10 @@ def undb(x_db: float) -> float:
 
 
 def sqrt_hann(n: int) -> np.ndarray:
-    # sqrt-Hann даёт идеальную реконструкцию при hop=n/2
     h = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
     return np.sqrt(np.maximum(h, 1e-8)).astype(np.float32)
 
 
-# ---------- YAMNet (опц.) ----------
 class YamnetTrigger:
     def __init__(self, sr_stream: int):
         self.enabled = _YAMNET_OK
@@ -117,14 +113,10 @@ class YamnetTrigger:
         return float(np.clip((m - 0.1) / 0.4, 0.0, 1.0))
 
 
-# ---------- основной процессор ----------
 class RealTimeProcessor:
     def __init__(self, cfg: RTConfig, stream_sr: int = 48000, blocksize: int = 480):
         self.cfg = cfg
         self.sr = int(np.clip(stream_sr, SR_SAFE_MIN, SR_SAFE_MAX))
-
-        # Внутренняя STFT-конфигурация (не зависящая от размера колбэка):
-        # ~40 мс окно, 50% overlap → мягкая маска и меньше «рубленности»
         target_win_ms = 40.0
         nfft = int(2 ** math.ceil(math.log2(self.sr * target_win_ms / 1000.0)))
         nfft = int(np.clip(nfft, 1024, 4096))  # пределы
@@ -133,37 +125,36 @@ class RealTimeProcessor:
         self.win = sqrt_hann(nfft)
         self.eps = 1e-8
 
-        # Пред/пост фильтры
         self.hpf = butter(2, 60 / (self.sr / 2), btype='highpass', output='sos')
-        # поднял LPF, чтобы речь не была «радио»:
+
         lpf_cut = min(16000, int(self.sr * 0.45))
         self.lpf = butter(4, lpf_cut / (self.sr / 2), btype='lowpass', output='sos')
 
-        # Буферы стриминга (STFT-OLA)
+
         self._inbuf = np.zeros(0, dtype=np.float32)
         self._prev_tail = np.zeros(self.nfft - self.hop, dtype=np.float32)
         self._outbuf = np.zeros(0, dtype=np.float32)
 
-        # Шум/маска
+
         self.noise_psd = np.ones(self.nfft // 2 + 1, dtype=np.float32) * 1e-6
         self.alpha_noise = 0.92
         self.prev_gain = np.ones_like(self.noise_psd)
 
-        # VAD
+
         self.vad_hist = 0.0
 
-        # YAMNet (опционально)
+
         self.yam = YamnetTrigger(self.sr)
 
-        # transient killer память
+
         self.last_mag = np.zeros(self.nfft // 2 + 1, dtype=np.float32)
 
-        # очень тихий комфорт-шум
+
         rng = np.random.default_rng(123)
         w = rng.standard_normal(self.nfft).astype(np.float32)
         self.comfort = (w / np.max(np.abs(w) + self.eps) * undb(-62)).astype(np.float32)
 
-    # --------- VAD / энергия ---------
+
     def _energy_band(self, x: np.ndarray, lo=200, hi=4000) -> float:
         X = np.fft.rfft(x * self.win[:x.size], n=self.nfft)
         mag = np.abs(X)
@@ -178,20 +169,19 @@ class RealTimeProcessor:
         self.vad_hist = 0.9 * self.vad_hist + 0.1 * p
         return float(np.clip(self.vad_hist, 0.0, 1.0))
 
-    # --------- один STFT-кадр ---------
+
     def _process_frame(self, frame: np.ndarray, p_speech: float, trig_boost: float) -> np.ndarray:
         X = np.fft.rfft(frame * self.win)
         mag = np.abs(X).astype(np.float32)
         phase = np.angle(X).astype(np.float32)
 
-        # обновление шума
+
         upd = self.alpha_noise if p_speech > 0.4 else 0.80
         self.noise_psd = upd * self.noise_psd + (1.0 - upd) * (mag ** 2)
 
         y = mag.copy()
 
         if self.cfg.enable_denoise:
-            # Винер + оверсабтракшн, сглаживание маски
             base_alpha = 2.2 + (1.6 if self.cfg.ultra_anc else 0.0) + 1.6 * trig_boost
             noise = np.maximum(self.noise_psd, 1e-12)
             snr = np.maximum((mag ** 2) / noise - 1.0, 0.0)
@@ -200,7 +190,7 @@ class RealTimeProcessor:
             over = base_alpha * (1.0 - 0.55 * p_speech)
             gain = np.clip(wiener - over * np.sqrt(noise) / (mag + 1e-9), 0.0, 1.0)
 
-            # transient killer (HF)
+
             hf_lo = hz_to_bin(1800, self.nfft, self.sr)
             crest = np.maximum(0.0, (mag - (0.88 * self.last_mag + 1e-6)) / (self.last_mag + 1e-6))
             tk = np.zeros_like(mag)
@@ -208,41 +198,41 @@ class RealTimeProcessor:
             self.last_mag = 0.9 * self.last_mag + 0.1 * mag
             gain *= (1.0 - 0.85 * tk)
 
-            # защита речи
+
             if self.cfg.protect_speech and p_speech > 0.15:
                 lo, hi = hz_to_bin(250, self.nfft, self.sr), hz_to_bin(3800, self.nfft, self.sr)
                 protect = 0.3 + 0.7 * (1.0 - self.cfg.trigger_sensitivity)
                 gain[lo:hi] = np.maximum(gain[lo:hi], protect * 0.4)
 
-            # сглаживание маски по времени (убирает «песок/дробление»)
+
             self.prev_gain = 0.75 * self.prev_gain + 0.25 * gain
             gain = self.prev_gain
 
-            # ограничим минимум (слишком глубокое — даёт развал тембра)
+
             min_gain = undb(-38.0 - 10.0 * float(self.cfg.vacuum_strength))
             gain = np.clip(gain, min_gain, 1.0)
 
             y *= gain
 
-        # вакуум
+
         if self.cfg.enable_vacuum:
             vac = np.clip(self.cfg.vacuum_strength, 0.0, 1.0)
             att = 16.0 + 16.0 * vac + 8.0 * trig_boost   # дБ
             post = undb(-att) ** (1.0 - p_speech)
             y *= post
 
-        # очень тихий пол — чтобы не «дззз»
+
         floor = undb(-62.0)
         y = np.maximum(y, floor * np.sqrt(self.noise_psd))
 
         Y = y * np.exp(1j * phase)
         y_time = np.fft.irfft(Y).real.astype(np.float32)
 
-        # пост-LPF чтобы смягчить кодек BT/вч песок
+
         y_time = sosfilt(self.lpf, y_time)
         return y_time
 
-    # --------- публичный шаг ---------
+
     def process_block(self, mono_in: np.ndarray) -> np.ndarray:
         x = mono_in.astype(np.float32)
         x = sosfilt(self.hpf, x)
@@ -253,43 +243,35 @@ class RealTimeProcessor:
         trig_boost = self.yam.boost() if self.cfg.enable_triggers else 0.0
         p_speech_now = self._vad(x) if self.cfg.protect_speech else 0.0
 
-        # накапливаем вход
+
         self._inbuf = np.concatenate([self._inbuf, x])
         out_chunks = []
 
         while self._inbuf.size >= self.hop:
-            # формируем кадр: прошлые nfft-hop + новые hop
             frame = np.empty(self.nfft, dtype=np.float32)
             frame[:self.nfft - self.hop] = self._prev_tail
             new = self._inbuf[:self.hop]
             frame[self.nfft - self.hop:] = new
-            self._prev_tail = frame[self.hop:]  # сдвиг для след. кадра
-            # потребляем hop
+            self._prev_tail = frame[self.hop:]
             self._inbuf = self._inbuf[self.hop:]
 
-            # VAD сглажим с прошлым (более стабильный)
+
             p_speech = 0.7 * self.vad_hist + 0.3 * p_speech_now
 
             y_frame = self._process_frame(frame, p_speech, trig_boost)
 
-            # OLA со sqrt-Hann: суммирование двух половинок → идеальная реконструкция
-            # отдаём сразу первую половину, вторую держим как overlap
             a = y_frame[:self.hop] * self.win[:self.hop]
             b = y_frame[self.hop:] * self.win[self.hop:]
 
             if self._outbuf.size < self.hop:
-                # расширим, если пусто
                 pad = np.zeros(self.hop - self._outbuf.size, dtype=np.float32)
                 self._outbuf = np.concatenate([self._outbuf, pad])
 
-            # складываем текущий "a" с накопленным overlap
             mixed = (self._outbuf[:self.hop] + a)
             out_chunks.append(mixed.astype(np.float32))
 
-            # готовим overlap для следующего шага
             self._outbuf = b.copy()
 
-        # если накопилось меньше hop, отдаём то, что есть (мягко)
         total_len = len(x)
         if out_chunks:
             y = np.concatenate(out_chunks)
@@ -297,11 +279,9 @@ class RealTimeProcessor:
             y = np.zeros(0, dtype=np.float32)
 
         if y.size < total_len:
-            # добираем недостающее из текущего overlap (без окна — он уже с win)
             need = total_len - y.size
             tail = self._outbuf[:need] if self._outbuf.size >= need else np.pad(self._outbuf, (0, need - self._outbuf.size))
             y = np.concatenate([y, tail])
-            # уменьшить буфер overlap на выданное
             if self._outbuf.size >= need:
                 self._outbuf = self._outbuf[need:]
             else:

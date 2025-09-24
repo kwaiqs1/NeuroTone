@@ -3,8 +3,6 @@ from __future__ import annotations
 import csv
 from typing import List, Dict
 
-# Небольшая карта переводов для самых частых раздражителей.
-# Остальные будут показаны как в оригинале (ENG), чтобы ничего не падало.
 _RU_TOKEN_MAP = {
     "chew": "чавканье",
     "chewing": "чавканье",
@@ -46,7 +44,6 @@ _RU_TOKEN_MAP = {
     "alarm": "сигнал/будильник",
 }
 
-# fallback на случай полной недоступности модели/CSV
 _FALLBACK = [
     "chewing", "slurp", "gulp", "lick", "mouth sounds", "breathing",
     "cough", "sneeze", "sniff", "snore",
@@ -59,11 +56,9 @@ def _to_ru(name: str) -> str:
     for k, v in _RU_TOKEN_MAP.items():
         if k in low:
             return v
-    # чуть улучшим читаемость EN
     return name.replace("_", " ")
 
 def load_yamnet_labels() -> List[str]:
-    """Пробуем достать class_map у локально закешированного YAMNet."""
     try:
         import tensorflow_hub as hub
         m = hub.load("https://tfhub.dev/google/yamnet/1")
@@ -73,14 +68,11 @@ def load_yamnet_labels() -> List[str]:
             reader = csv.DictReader(f)
             for row in reader:
                 labels.append(row.get("display_name") or row.get("name") or "")
-        # фильтруем пустые
         return [x for x in labels if x]
     except Exception:
-        # если не вышло — отдаём fallback
         return list(_FALLBACK)
 
 def labels_ru() -> List[Dict]:
-    """Собираем [{idx, en, ru}] для фронта."""
     en = load_yamnet_labels()
     out = []
     for i, name in enumerate(en):

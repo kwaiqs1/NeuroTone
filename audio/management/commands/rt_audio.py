@@ -4,7 +4,6 @@ import numpy as np
 import sounddevice as sd
 from django.core.management.base import BaseCommand
 
-# ленивый импорт realtime после выбора sample rate
 
 class Command(BaseCommand):
     help = "Real-time audio pipeline: mic -> filters -> headphones"
@@ -58,19 +57,18 @@ class Command(BaseCommand):
         in_ch  = 2 if in_info["max_input_channels"]  >= 2 else 1
         out_ch = 2 if out_info["max_output_channels"] >= 2 else 1
 
-        # Выбираем рабочую частоту потока
+
         candidates = []
         if opts["sr"]: candidates.append(int(opts["sr"]))
         if out_info.get("default_samplerate"): candidates.append(int(out_info["default_samplerate"]))
         if in_info.get("default_samplerate"):  candidates.append(int(in_info["default_samplerate"]))
         candidates += [48000, 44100, 32000, 16000]
-        # Убираем дубликаты, сохраняя порядок
         seen = set(); sr_list = []
         for s in candidates:
             if s not in seen:
                 seen.add(s); sr_list.append(s)
 
-        from audio.realtime import RealTimeProcessor, RTConfig  # ленивый импорт
+        from audio.realtime import RealTimeProcessor, RTConfig
 
         cfg = RTConfig(
             trigger_sensitivity=opts["sensitivity"],
@@ -85,7 +83,7 @@ class Command(BaseCommand):
         chosen_sr = None
         last_err = None
 
-        # Пробуем открыть поток на первом подходящем sr
+
         for sr in sr_list:
             try:
                 proc = RealTimeProcessor(cfg, stream_sr=sr, blocksize=opts["block"])
