@@ -1,207 +1,195 @@
-import threading
-import traceback
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Dict, Any, Optional, Tuple, List
 
 import numpy as np
 import sounddevice as sd
 
 from .realtime import RealTimeProcessor, RTConfig
 
+# Безопасные значения по умолчанию
+DEFAULT_SR_CANDIDATES = [48000, 44100]
+DEFAULT_BLOCK = 480
+DEFAULT_CHANNELS = 1  # см. комментарий в start(): один канал для duplex Stream
 
-__all__ = ["rt_manager", "RTManager", "RTState"]
 
+def _hostapis() -> List[str]:
+    try:
+        ha = sd.query_hostapis()
+        return [h.get("name", f"hostapi#{i}") for i, h in enumerate(ha)]
+    except Exception:
+        return []
+
+
+def _fmt_label(idx: int, dev: Dict[str, Any], hostapis_names: List[str]) -> str:
+    h = hostapis_names[dev.get("hostapi", 0)] if hostapis_names else ""
+    ins, outs = int(dev.get("max_input_channels", 0)), int(dev.get("max_output_channels", 0))
+    name = dev.get("name", f"device#{idx}")
+    tail = f"(in:{ins}, out:{outs})"
+    hstr = f" — {h}" if h else ""
+    return f"[{idx}] {name}{hstr} {tail}"
 
 
 @dataclass
-class RTState:
-    running: bool = False
+class _State:
+    stream: Optional[sd.Stream] = None
+    proc: Optional[RealTimeProcessor] = None
     frames: int = 0
-    samplerate: Optional[int] = None
-    blocksize: Optional[int] = None
+    running: bool = False
+    sr: Optional[int] = None
+    block: Optional[int] = None
     channels: Optional[int] = None
-    in_dev: Optional[int] = None
-    out_dev: Optional[int] = None
     last_error: Optional[str] = None
+    started_at: Optional[float] = None
 
 
 class RTManager:
-    """
-    Один-единственный менеджер реального времени.
-    Содержит sounddevice.Stream, процессор и текущее состояние.
-    """
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.stream: Optional[sd.Stream] = None
-        self.processor: Optional[RealTimeProcessor] = None
-        self.state = RTState()
-        self._cfg: Optional[RTConfig] = None
+    def __init__(self) -> None:
+        self.s = _State()
 
-    # --------- внутренний callback PortAudio ----------
-    def _callback(self, indata, outdata, frames, time, status):
-        try:
-            if status:
-                # Можно залогировать предупреждения PortAudio
-                # print("PortAudio status:", status)
-                pass
-
-            # indata shape: (frames, channels), float32
-            y = self.processor.process_block(indata)
-            # гарантируем корректную форму/тип
-            if not isinstance(y, np.ndarray):
-                y = np.asarray(y, dtype=np.float32)
-
-            if y.dtype != np.float32:
-                y = y.astype(np.float32, copy=False)
-
-            # Если процессор вернул моно при stereo-выводе — повторим канал
-            if y.ndim == 1:
-                y = y[:, None]
-
-            if y.shape[1] != self.state.channels:
-                if y.shape[1] == 1 and self.state.channels == 2:
-                    y = np.repeat(y, 2, axis=1)
-                elif y.shape[1] == 2 and self.state.channels == 1:
-                    y = y[:, :1]
-                else:
-                    # на всякий — принудительно привести размерность
-                    y = np.resize(y, (frames, self.state.channels))
-
-            outdata[:] = y
-            self.state.frames += frames
-        except Exception:
-            # В случае ошибки не роняем поток, а отдаем тишину
-            outdata.fill(0.0)
-            self.state.last_error = traceback.format_exc()
-
-    # --------- публичные методы для views_rt ----------
+    # ---------- devices ----------
     def list_devices(self) -> Dict[str, Any]:
-        """Вернуть список устройств для UI."""
-        devices = sd.query_devices()
-        hostapis = sd.query_hostapis()
-        # Сформируем удобные подписи, как в UI
-        items = []
-        for idx, d in enumerate(devices):
-            io = []
-            if d['max_input_channels'] > 0:
-                io.append(f"in:{d['max_input_channels']}")
-            if d['max_output_channels'] > 0:
-                io.append(f"out:{d['max_output_channels']}")
-            io_str = ", ".join(io) if io else "—"
-            host = hostapis[d['hostapi']]['name']
-            items.append({
-                "index": idx,
-                "label": f"[{idx}] {d['name']} — {host} ({io_str})",
-                "max_input": d['max_input_channels'],
-                "max_output": d['max_output_channels'],
-                "default_samplerate": int(d['default_samplerate']) if d['default_samplerate'] else None,
-            })
-        return {"ok": True, "devices": items}
+        try:
+            devs = sd.query_devices()
+            hostapis_names = _hostapis()
 
-    def start(self,
-              in_index: int,
-              out_index: int,
-              samplerate: Optional[int],
-              blocksize: Optional[int],
-              channels: Optional[int],
-              cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Создать Stream с callback, запустить. Главное: callback передаём В КОНСТРУКТОР.
-        """
-        with self._lock:
-            # если уже работает — останавливаем
-            if self.state.running:
-                self._stop_locked()
+            inputs, outputs = [], []
+            for i, d in enumerate(devs):
+                lab = _fmt_label(i, d, hostapis_names)
+                if int(d.get("max_input_channels", 0)) > 0:
+                    inputs.append({"index": i, "label": lab})
+                if int(d.get("max_output_channels", 0)) > 0:
+                    outputs.append({"index": i, "label": lab})
 
-            # подобрать параметры по умолчанию
-            if not samplerate or int(samplerate) <= 0:
-                sr = int(sd.query_devices(in_index, 'input')['default_samplerate'])
-            else:
-                sr = int(samplerate)
-
-            bs = int(blocksize) if (blocksize and int(blocksize) > 0) else 480
-            ch = int(channels) if (channels and int(channels) in (1, 2)) else 1
-
-            # подготовить процессор и конфиг
-            self._cfg = RTConfig(**cfg_dict)
-            self.processor = RealTimeProcessor(
-                sr=sr,
-                block=bs,
-                channels=ch,
-                config=self._cfg
-            )
-
-            # ВАЖНО: callback передаем сюда, а не в .start()
-            try:
-                self.stream = sd.Stream(
-                    device=(in_index, out_index),
-                    samplerate=sr,
-                    blocksize=bs,
-                    dtype='float32',
-                    channels=ch,
-                    callback=self._callback,   # <-- ключевое изменение
-                )
-            except TypeError:
-                # Фолбэк для старых sounddevice (иногда channels нельзя задавать единым числом)
-                self.stream = sd.Stream(
-                    device=(in_index, out_index),
-                    samplerate=sr,
-                    blocksize=bs,
-                    dtype='float32',
-                    # попробуем без channels — sd сам возьмёт максимально допустимое,
-                    # а processor приведёт форму
-                    callback=self._callback,
-                )
-
-            # запуск без аргументов
-            self.stream.start()
-
-            self.state = RTState(
-                running=True,
-                frames=0,
-                samplerate=sr,
-                blocksize=bs,
-                channels=ch,
-                in_dev=in_index,
-                out_dev=out_index,
-                last_error=None
-            )
+            di, do = sd.default.device
             return {
                 "ok": True,
-                "sr": sr,
-                "block": bs,
-                "channels": ch
+                "inputs": inputs,
+                "outputs": outputs,
+                "default_in": int(di) if di is not None else (inputs[0]["index"] if inputs else None),
+                "default_out": int(do) if do is not None else (outputs[0]["index"] if outputs else None),
             }
+        except Exception as e:
+            return {"ok": False, "error": f"list_devices: {e}"}
+
+    # ---------- start/stop ----------
+    def start(
+        self,
+        in_index: int,
+        out_index: int,
+        samplerate: Optional[int] = None,
+        blocksize: Optional[int] = None,
+        channels: Optional[int] = None,
+        cfg_dict: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # аккуратно останавливаем, если уже запущено
+        if self.s.stream is not None:
+            self.stop()
+
+        # резолвим параметры
+        sr = int(samplerate) if samplerate else None
+        if sr is None:
+            # пробуем взять дефолт устройства, если не подходит — fallback
+            try:
+                idef = sd.query_devices(in_index).get("default_samplerate")
+                odef = sd.query_devices(out_index).get("default_samplerate")
+                cand = [int(idef) if idef else None, int(odef) if odef else None]
+                sr = next((c for c in cand if c), None)
+            except Exception:
+                sr = None
+        if sr is None:
+            for c in DEFAULT_SR_CANDIDATES:
+                sr = c
+                break
+
+        block = int(blocksize) if blocksize else DEFAULT_BLOCK
+        ch = int(channels) if channels else DEFAULT_CHANNELS  # duplex Stream требует одинаковые in/out
+
+        # конфиг realtime процессора
+        cfg = RTConfig(
+            trigger_threshold=float(cfg_dict.get("trigger_threshold", 0.10)) if cfg_dict else 0.10,
+            vacuum_strength=float(cfg_dict.get("vacuum_strength", 1.0)) if cfg_dict else 1.0,
+            protect_speech=bool(cfg_dict.get("protect_speech", True)) if cfg_dict else True,
+            trigger_kill=bool(cfg_dict.get("trigger_kill", True)) if cfg_dict else True,
+            ultra_anc=bool(cfg_dict.get("ultra_anc", False)) if cfg_dict else False,
+            selected_triggers=cfg_dict.get("selected_triggers", []) if cfg_dict else [],
+        )
+        proc = RealTimeProcessor(cfg)
+
+        def _cb(indata, outdata, frames, time_info, status):
+            if status:
+                # просто пишем статус в лог статистики, не валим поток
+                self.s.last_error = str(status)
+            try:
+                # indata/outdata shape: (frames, ch)
+                mono_in = indata[:, 0] if indata.ndim == 2 else indata
+                mono_out = proc.process_block(mono_in.astype(np.float32, copy=False))
+                if mono_out.ndim == 1:
+                    mono_out = mono_out.reshape(-1, 1)
+                # дублируем на все каналы (их ch одинаково для in/out)
+                if mono_out.shape[1] < ch:
+                    mono_out = np.repeat(mono_out, ch, axis=1)
+                outdata[:] = mono_out[:frames, :ch]
+                self.s.frames += int(frames)
+            except Exception as e:
+                self.s.last_error = f"callback: {e}"
+
+        # создаём duplex stream (одинаковые channels для in/out)
+        try:
+            stream = sd.Stream(
+                samplerate=sr,
+                blocksize=block,
+                device=(in_index, out_index),
+                dtype="float32",
+                channels=ch,
+                callback=_cb,
+            )
+            stream.start()
+
+            self.s = _State(
+                stream=stream,
+                proc=proc,
+                frames=0,
+                running=True,
+                sr=sr,
+                block=block,
+                channels=ch,
+                last_error=None,
+                started_at=time.time(),
+            )
+            return {"ok": True, "sr": sr, "block": block, "channels": ch}
+        except Exception as e:
+            self.s.last_error = str(e)
+            return {"ok": False, "error": f"start: {e}"}
 
     def stop(self) -> Dict[str, Any]:
-        with self._lock:
-            self._stop_locked()
-            return {"ok": True}
-
-    def _stop_locked(self):
-        if self.stream is not None:
-            try:
-                self.stream.stop()
-            finally:
+        try:
+            if self.s.stream is not None:
                 try:
-                    self.stream.close()
+                    self.s.stream.stop()
                 finally:
-                    self.stream = None
-        self.processor = None
-        self.state = RTState(running=False)
+                    self.s.stream.close()
+            self.s = _State()
+            return {"ok": True}
+        except Exception as e:
+            self.s.last_error = str(e)
+            return {"ok": False, "error": f"stop: {e}"}
 
     def stats(self) -> Dict[str, Any]:
         return {
             "ok": True,
-            "frames": self.state.frames,
-            "samplerate": self.state.samplerate,
-            "blocksize": self.state.blocksize,
-            "channels": self.state.channels,
-            "in_dev": self.state.in_dev,
-            "out_dev": self.state.out_dev,
-            "last_error": self.state.last_error,
+            "running": self.s.running,
+            "frames": self.s.frames,
+            "samplerate": self.s.sr,
+            "block": self.s.block,
+            "channels": self.s.channels,
+            "last_error": self.s.last_error,
+            "uptime_sec": (time.time() - self.s.started_at) if (self.s.running and self.s.started_at) else 0.0,
         }
 
 
-# Синглтон для импорта во views_rt.py
+# Синглтон на модуль
 rt_manager = RTManager()
