@@ -1,9 +1,7 @@
-# audio/rt_manager.py
-# Менеджер реального времени: поток sounddevice + наш DSP, управление из вьюх.
-
-import json
 import threading
-from typing import Optional, Iterable, Dict, Any
+import traceback
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import sounddevice as sd
@@ -11,147 +9,195 @@ import sounddevice as sd
 from .realtime import RealTimeProcessor, RTConfig
 
 
-class _RTState:
+@dataclass
+class RTState:
+    running: bool = False
+    frames: int = 0
+    samplerate: Optional[int] = None
+    blocksize: Optional[int] = None
+    channels: Optional[int] = None
+    in_dev: Optional[int] = None
+    out_dev: Optional[int] = None
+    last_error: Optional[str] = None
+
+
+class RTManager:
+    """
+    Один-единственный менеджер реального времени.
+    Содержит sounddevice.Stream, процессор и текущее состояние.
+    """
     def __init__(self):
-        self.lock = threading.Lock()
+        self._lock = threading.Lock()
         self.stream: Optional[sd.Stream] = None
-        self.proc: Optional[RealTimeProcessor] = None
-        self.frames = 0
-        self.samplerate = None
-        self.channels = None
-        self.block = None
-        self.running = False
+        self.processor: Optional[RealTimeProcessor] = None
+        self.state = RTState()
+        self._cfg: Optional[RTConfig] = None
 
-state = _RTState()
-
-
-def _make_processor(cfg_dict: Dict[str, Any], samplerate: int, blocksize: int,
-                    triggers: Optional[Iterable[str]]) -> RealTimeProcessor:
-    cfg = RTConfig(
-        trigger_sensitivity=float(cfg_dict.get("trigger_sensitivity", 0.08)),
-        vacuum_strength=float(cfg_dict.get("vacuum_strength", 1.0)),
-        protect_speech=bool(cfg_dict.get("protect_speech", True)),
-        enable_triggers=bool(cfg_dict.get("enable_triggers", True)),
-        enable_vacuum=bool(cfg_dict.get("enable_vacuum", True)),
-        enable_denoise=bool(cfg_dict.get("enable_denoise", True)),
-        ultra_anc=bool(cfg_dict.get("ultra_anc", True)),
-    )
-    return RealTimeProcessor(cfg, stream_sr=int(samplerate),
-                             blocksize=int(blocksize),
-                             selected_triggers=list(triggers) if triggers else None)
-
-
-def start(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    params: {
-        in_index, out_index, samplerate?, block, channels,
-        cfg: {...},
-        triggers: [label1, label2, ...]
-    }
-    """
-    with state.lock:
-        if state.stream is not None:
-            stop()
-
-        in_index = int(params["in_index"])
-        out_index = int(params["out_index"])
-        samplerate = int(params.get("samplerate") or 0) or None
-        block = int(params.get("block") or 480)
-        channels = int(params.get("channels") or 1)
-        cfg = params.get("cfg", {})
-        triggers = params.get("triggers") or []
-
-        # если samplerate не задан — спросим у устройства
-        if samplerate is None:
-            dev = sd.query_devices(in_index)
-            samplerate = int(dev["default_samplerate"]) if dev.get("default_samplerate") else 48000
-
-        proc = _make_processor(cfg, samplerate, block, triggers)
-
-        def callback(indata, outdata, frames, time, status):
+    # --------- внутренний callback PortAudio ----------
+    def _callback(self, indata, outdata, frames, time, status):
+        try:
             if status:
-                # просто пишем в stderr и продолжим
-                print("SD status:", status)
-            # берём 1 канал (моно)
-            mono = indata[:, 0].copy()
-            y = proc.process_block(mono)
-            # моно → стерео при необходимости
-            if outdata.shape[1] == 1:
-                outdata[:, 0] = y
+                # Можно залогировать предупреждения PortAudio
+                # print("PortAudio status:", status)
+                pass
+
+            # indata shape: (frames, channels), float32
+            y = self.processor.process_block(indata)
+            # гарантируем корректную форму/тип
+            if not isinstance(y, np.ndarray):
+                y = np.asarray(y, dtype=np.float32)
+
+            if y.dtype != np.float32:
+                y = y.astype(np.float32, copy=False)
+
+            # Если процессор вернул моно при stereo-выводе — повторим канал
+            if y.ndim == 1:
+                y = y[:, None]
+
+            if y.shape[1] != self.state.channels:
+                if y.shape[1] == 1 and self.state.channels == 2:
+                    y = np.repeat(y, 2, axis=1)
+                elif y.shape[1] == 2 and self.state.channels == 1:
+                    y = y[:, :1]
+                else:
+                    # на всякий — принудительно привести размерность
+                    y = np.resize(y, (frames, self.state.channels))
+
+            outdata[:] = y
+            self.state.frames += frames
+        except Exception:
+            # В случае ошибки не роняем поток, а отдаем тишину
+            outdata.fill(0.0)
+            self.state.last_error = traceback.format_exc()
+
+    # --------- публичные методы для views_rt ----------
+    def list_devices(self) -> Dict[str, Any]:
+        """Вернуть список устройств для UI."""
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        # Сформируем удобные подписи, как в UI
+        items = []
+        for idx, d in enumerate(devices):
+            io = []
+            if d['max_input_channels'] > 0:
+                io.append(f"in:{d['max_input_channels']}")
+            if d['max_output_channels'] > 0:
+                io.append(f"out:{d['max_output_channels']}")
+            io_str = ", ".join(io) if io else "—"
+            host = hostapis[d['hostapi']]['name']
+            items.append({
+                "index": idx,
+                "label": f"[{idx}] {d['name']} — {host} ({io_str})",
+                "max_input": d['max_input_channels'],
+                "max_output": d['max_output_channels'],
+                "default_samplerate": int(d['default_samplerate']) if d['default_samplerate'] else None,
+            })
+        return {"ok": True, "devices": items}
+
+    def start(self,
+              in_index: int,
+              out_index: int,
+              samplerate: Optional[int],
+              blocksize: Optional[int],
+              channels: Optional[int],
+              cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Создать Stream с callback, запустить. Главное: callback передаём В КОНСТРУКТОР.
+        """
+        with self._lock:
+            # если уже работает — останавливаем
+            if self.state.running:
+                self._stop_locked()
+
+            # подобрать параметры по умолчанию
+            if not samplerate or int(samplerate) <= 0:
+                sr = int(sd.query_devices(in_index, 'input')['default_samplerate'])
             else:
-                outdata[:, 0] = y
-                outdata[:, 1] = y
-            state.frames += frames
+                sr = int(samplerate)
 
-        stream = sd.Stream(
-            device=(in_index, out_index),
-            samplerate=samplerate,
-            blocksize=block,
-            dtype="float32",
-            channels=(channels, 2 if channels < 2 else channels)  # in, out
-        )
+            bs = int(blocksize) if (blocksize and int(blocksize) > 0) else 480
+            ch = int(channels) if (channels and int(channels) in (1, 2)) else 1
 
-        stream.start(callback=callback)
+            # подготовить процессор и конфиг
+            self._cfg = RTConfig(**cfg_dict)
+            self.processor = RealTimeProcessor(
+                sr=sr,
+                block=bs,
+                channels=ch,
+                config=self._cfg
+            )
 
-        state.stream = stream
-        state.proc = proc
-        state.frames = 0
-        state.samplerate = samplerate
-        state.channels = channels
-        state.block = block
-        state.running = True
+            # ВАЖНО: callback передаем сюда, а не в .start()
+            try:
+                self.stream = sd.Stream(
+                    device=(in_index, out_index),
+                    samplerate=sr,
+                    blocksize=bs,
+                    dtype='float32',
+                    channels=ch,
+                    callback=self._callback,   # <-- ключевое изменение
+                )
+            except TypeError:
+                # Фолбэк для старых sounddevice (иногда channels нельзя задавать единым числом)
+                self.stream = sd.Stream(
+                    device=(in_index, out_index),
+                    samplerate=sr,
+                    blocksize=bs,
+                    dtype='float32',
+                    # попробуем без channels — sd сам возьмёт максимально допустимое,
+                    # а processor приведёт форму
+                    callback=self._callback,
+                )
 
+            # запуск без аргументов
+            self.stream.start()
+
+            self.state = RTState(
+                running=True,
+                frames=0,
+                samplerate=sr,
+                blocksize=bs,
+                channels=ch,
+                in_dev=in_index,
+                out_dev=out_index,
+                last_error=None
+            )
+            return {
+                "ok": True,
+                "sr": sr,
+                "block": bs,
+                "channels": ch
+            }
+
+    def stop(self) -> Dict[str, Any]:
+        with self._lock:
+            self._stop_locked()
+            return {"ok": True}
+
+    def _stop_locked(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+            finally:
+                try:
+                    self.stream.close()
+                finally:
+                    self.stream = None
+        self.processor = None
+        self.state = RTState(running=False)
+
+    def stats(self) -> Dict[str, Any]:
         return {
             "ok": True,
-            "samplerate": samplerate,
-            "channels": channels,
-            "block": block,
+            "frames": self.state.frames,
+            "samplerate": self.state.samplerate,
+            "blocksize": self.state.blocksize,
+            "channels": self.state.channels,
+            "in_dev": self.state.in_dev,
+            "out_dev": self.state.out_dev,
+            "last_error": self.state.last_error,
         }
 
 
-def stop() -> Dict[str, Any]:
-    with state.lock:
-        if state.stream is not None:
-            try:
-                state.stream.stop()
-                state.stream.close()
-            except Exception:
-                pass
-            state.stream = None
-            state.proc = None
-        state.running = False
-        return {"ok": True}
-
-
-def stats() -> Dict[str, Any]:
-    with state.lock:
-        return {
-            "running": state.running,
-            "frames": state.frames,
-            "samplerate": state.samplerate,
-            "channels": state.channels,
-            "block": state.block,
-        }
-
-
-def available_triggers() -> Dict[str, Any]:
-    """
-    Возвращает список {id,label,ru} для UI.
-    Если DSP ещё не создан, поднимаем временный процессор на дефолтных значениях.
-    """
-    with state.lock:
-        proc = state.proc
-
-    tmp_created = False
-    if proc is None:
-        # мини-временный процессор только чтобы прочитать список меток
-        proc = _make_processor({}, 48000, 480, [])
-        tmp_created = True
-
-    try:
-        items = proc.available_trigger_labels()
-        return {"ok": True, "items": items}
-    finally:
-        if tmp_created:
-            # просто даём GC убрать — ничего не стартовали
-            pass
+# Синглтон для импорта во views_rt.py
+rt_manager = RTManager()

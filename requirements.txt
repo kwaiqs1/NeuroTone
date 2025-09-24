@@ -17,3 +17,5 @@ torchvision
 panns-inference==0.1.0
 sounddevice==0.4.6
 webrtcvad-wheels
+sounddevice>=0.4.6
+numpy>=1.23
