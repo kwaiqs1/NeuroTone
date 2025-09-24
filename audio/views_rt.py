@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 from django.http import JsonResponse, HttpRequest, HttpResponse
 from django.shortcuts import render
+from django.views.decorators.csrf import csrf_exempt  # <-- важно
 
 from . import rt_manager
 
@@ -33,19 +34,21 @@ def rt_triggers(request: HttpRequest) -> JsonResponse:
     return _json_ok(rt_manager.trigger_list())
 
 
+@csrf_exempt  # <-- снимаем CSRF, чтобы fetch POST из UI не получал HTML-403
 def rt_start(request: HttpRequest) -> JsonResponse:
     if request.method != "POST":
         return _json_err("POST required", 405)
+
     try:
         payload = json.loads(request.body or "{}")
     except Exception:
         payload = {}
 
-    # ничего не преобразуем здесь — rt_manager сам делает алиасы и валидацию
     result = rt_manager.start(payload)
     return _json_ok(result) if result.get("ok") else _json_err(result.get("error", "start error"))
 
 
+@csrf_exempt  # <-- тоже важно
 def rt_stop(request: HttpRequest) -> JsonResponse:
     if request.method != "POST":
         return _json_err("POST required", 405)

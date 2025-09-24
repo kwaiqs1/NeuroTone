@@ -135,15 +135,19 @@
     stateDot.classList.toggle('stopped', !r);
   }
 
-  async function api(path, opts){
-    try{
-      const res = await fetch(path, Object.assign({
-        headers: {'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'}
-      }, opts||{}));
-      const data = await res.json();
-      return {ok: res.ok && data.ok !== false, data};
-    }catch(e){
-      return {ok:false, data:{error:String(e)}};
+  async function postJSON(url, data) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+      credentials: 'same-origin',
+    });
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      return await res.json();
+    } else {
+      const text = await res.text();
+      throw new Error(text);
     }
   }
 
