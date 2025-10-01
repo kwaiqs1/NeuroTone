@@ -1,14 +1,12 @@
-# audio/learn/trigger_infer.py
 import os, json
 from typing import Dict
 import numpy as np
-import librosa
 import tensorflow as tf
 
 class LocalTriggerInfer:
     """
-    Версия без PyTorch: Keras-модель + librosa.
-    Совместимая с реальным временем (интерфейс push/get_probs/boost).
+    Keras-модель + TF-мелы, без librosa/soxr.
+    Совместима с реалтаймом (push/get_probs/boost).
     """
     def __init__(self, model_dir: str = "models", sr_stream: int = 48000):
         self.model_path   = os.path.join(model_dir, "trigger_cls_keras.h5")
@@ -40,17 +38,46 @@ class LocalTriggerInfer:
             except Exception:
                 self.enabled = False
 
-    def _mel_from_wav(self, y: np.ndarray) -> np.ndarray:
-        S = librosa.feature.melspectrogram(
-            y=y, sr=self.target_sr, n_fft=self.n_fft, hop_length=self.hop,
-            n_mels=self.n_mels, fmin=self.fmin, fmax=self.fmax, power=2.0, center=True
-        )
-        S_db = librosa.power_to_db(S, ref=np.max)
+    @staticmethod
+    def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-10, top_db: float = 80.0) -> np.ndarray:
+        S = np.maximum(S, amin)
+        log_spec = 10.0 * np.log10(S)
+        if np.isscalar(ref):
+            log_spec -= 10.0 * np.log10(ref)
+        else:
+            log_spec -= 10.0 * np.log10(np.maximum(ref, amin))
+        if top_db is not None:
+            log_spec = np.maximum(log_spec, log_spec.max() - float(top_db))
+        return log_spec
+
+    def _mel_from_wav(self, y16: np.ndarray) -> np.ndarray:
+        pad = self.n_fft // 2
+        ypad = np.pad(y16, (pad, pad), mode="reflect").astype(np.float32)
+
+        frames = tf.signal.stft(
+            tf.convert_to_tensor(ypad, dtype=tf.float32),
+            frame_length=self.n_fft, frame_step=self.hop,
+            window_fn=tf.signal.hann_window, pad_end=False
+        )  # [T, F]
+        power = tf.math.square(tf.abs(frames))  # [T, F]
+
+        mel_w = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=self.n_mels,
+            num_spectrogram_bins=self.n_fft // 2 + 1,
+            sample_rate=self.target_sr,
+            lower_edge_hertz=self.fmin,
+            upper_edge_hertz=self.fmax
+        )  # [F, M]
+        mel = tf.matmul(power, mel_w)  # [T, M]
+        mel = mel.numpy().astype(np.float32).T  # [M, T]
+
+        S_db = self._power_to_db(mel, ref=np.max(mel))
         mu, std = S_db.mean(), S_db.std() + 1e-6
         S_n = (S_db - mu) / std
+
         if S_n.shape[1] < self.fix_T:
-            pad = self.fix_T - S_n.shape[1]
-            S_n = np.pad(S_n, ((0,0),(0,pad)), mode="constant")
+            pad_t = self.fix_T - S_n.shape[1]
+            S_n = np.pad(S_n, ((0,0),(0,pad_t)), mode="constant")
         elif S_n.shape[1] > self.fix_T:
             i0 = (S_n.shape[1] - self.fix_T)//2
             S_n = S_n[:, i0:i0+self.fix_T]
@@ -67,7 +94,7 @@ class LocalTriggerInfer:
     def push(self, x: np.ndarray, sr: int, dt: float):
         if not self.enabled:
             return
-        # децимация до 16 кГц (грубая, но быстрая)
+        # децимация до 16 кГц (простая, но быстрая)
         x16 = x[::self.decim] if self.decim > 1 else x
         if x16.size == 0:
             return
@@ -98,4 +125,3 @@ class LocalTriggerInfer:
         m = max([self.last_probs.get(k, 0.0) for k in keys] + [0.0])
         # картируем 0.3..0.9 -> 0..1
         return float(np.clip((m - 0.3) / 0.6, 0.0, 1.0))
-

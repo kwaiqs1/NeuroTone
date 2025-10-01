@@ -1,8 +1,8 @@
-# audio/management/commands/train_triggers.py
 import os, json, random
 from typing import List, Tuple
 import numpy as np
-import librosa
+import soundfile as sf
+from scipy.signal import resample_poly
 import tensorflow as tf
 from tensorflow import keras
 from django.core.management.base import BaseCommand
@@ -16,7 +16,7 @@ HOP        = 160           # 10 мс при 16 кГц
 N_FFT      = 1024
 FMIN, FMAX = 40.0, 8000.0
 WIN_SEC    = 1.2           # длина окна для обучения/валидации
-FIX_T      = 120           # целевое число временных кадров (примерно 1.2с / 10мс)
+FIX_T      = 120           # целевое число временных кадров (≈1.2 c / 10 мс)
 
 def _scan_files() -> Tuple[List[Tuple[str,int]], List[str]]:
     classes = []
@@ -40,36 +40,75 @@ def _scan_files() -> Tuple[List[Tuple[str,int]], List[str]]:
     random.shuffle(files)
     return files, classes
 
-def _mel_from_wav(y: np.ndarray) -> np.ndarray:
-    # mel power
-    S = librosa.feature.melspectrogram(
-        y=y, sr=TARGET_SR, n_fft=N_FFT, hop_length=HOP,
-        n_mels=N_MELS, fmin=FMIN, fmax=FMAX, power=2.0, center=True
-    )  # [mels, frames]
-    S_db = librosa.power_to_db(S, ref=np.max)
-    # нормировка
+def _read_mono_32f(path: str) -> Tuple[np.ndarray, int]:
+    y, sr = sf.read(path, always_2d=False, dtype="float32")
+    if y.ndim == 2:
+        y = y.mean(axis=1)
+    return y.astype(np.float32), int(sr)
+
+def _resample_if_needed(y: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    if sr == target_sr:
+        return y.astype(np.float32)
+    # устойчивый и быстрый ресемплинг без numba
+    g = np.gcd(int(sr), int(target_sr))
+    up, down = target_sr // g, sr // g
+    return resample_poly(y, up, down).astype(np.float32)
+
+
+def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-10, top_db: float = 80.0) -> np.ndarray:
+    S = np.maximum(S, amin)
+    log_spec = 10.0 * np.log10(S)
+    if np.isscalar(ref):
+        log_spec -= 10.0 * np.log10(ref)
+    else:
+        log_spec -= 10.0 * np.log10(np.maximum(ref, amin))
+    if top_db is not None:
+        log_spec = np.maximum(log_spec, log_spec.max() - float(top_db))
+    return log_spec
+
+def _mel_from_wav(y16: np.ndarray) -> np.ndarray:
+    # центрирование как в librosa(center=True): паддинг половины окна
+    pad = N_FFT // 2
+    ypad = np.pad(y16, (pad, pad), mode="reflect").astype(np.float32)
+
+    frames = tf.signal.stft(
+        tf.convert_to_tensor(ypad, dtype=tf.float32),
+        frame_length=N_FFT, frame_step=HOP,
+        window_fn=tf.signal.hann_window, pad_end=False
+    )  # [T, F]
+    power = tf.math.square(tf.abs(frames))  # [T, F]
+    mel_w = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=N_MELS,
+        num_spectrogram_bins=N_FFT // 2 + 1,
+        sample_rate=TARGET_SR,
+        lower_edge_hertz=FMIN,
+        upper_edge_hertz=FMAX
+    )  # [F, M]
+    mel = tf.matmul(power, mel_w)  # [T, M]
+    mel = mel.numpy().astype(np.float32).T  # -> [M, T]
+
+    S_db = _power_to_db(mel, ref=np.max(mel))
     mu, std = S_db.mean(), S_db.std() + 1e-6
     S_n = (S_db - mu) / std
+
     # по времени до FIX_T
     if S_n.shape[1] < FIX_T:
-        pad = FIX_T - S_n.shape[1]
-        S_n = np.pad(S_n, ((0,0),(0,pad)), mode="constant")
+        pad_t = FIX_T - S_n.shape[1]
+        S_n = np.pad(S_n, ((0,0),(0,pad_t)), mode="constant")
     elif S_n.shape[1] > FIX_T:
         i0 = (S_n.shape[1] - FIX_T)//2
         S_n = S_n[:, i0:i0+FIX_T]
     return S_n.astype(np.float32)  # [M,T]
 
 def _load_clip(path: str, deterministic: bool) -> np.ndarray:
-    y, _sr = librosa.load(path, sr=TARGET_SR, mono=True)
+    y, sr = _read_mono_32f(path)
+    y = _resample_if_needed(y, sr, TARGET_SR)
     need = int(WIN_SEC * TARGET_SR)
     if y.shape[0] < need:
         pad = need - y.shape[0]
         y = np.pad(y, (0, pad))
     else:
-        if deterministic:
-            i0 = (y.shape[0] - need)//2
-        else:
-            i0 = random.randint(0, y.shape[0] - need)
+        i0 = (y.shape[0] - need)//2 if deterministic else random.randint(0, y.shape[0] - need)
         y = y[i0:i0+need]
     return y
 
@@ -92,13 +131,13 @@ def build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=2) -> keras.Model:
     return model
 
 class Command(BaseCommand):
-    help = "Train tiny local trigger classifier (TensorFlow) from data/triggers/<class>/*.mp3|*.wav"
+    help = "Train tiny local trigger classifier (TensorFlow, no librosa) from data/triggers/<class>/*.mp3|*.wav"
 
     def add_arguments(self, parser):
         parser.add_argument("--epochs", type=int, default=18)
         parser.add_argument("--batch",  type=int, default=32)
         parser.add_argument("--val_split", type=float, default=0.15)
-        parser.add_argument("--aug_per_file", type=int, default=1,
+        parser.add_argument("--aug_per_file", type=int, default=2,
                             help="сколько случайных окон генерировать с одного файла (train)")
 
     def handle(self, *args, **opts):
@@ -114,7 +153,6 @@ class Command(BaseCommand):
         # --- готовим данные ---
         X_tr, y_tr = [], []
         for path, cid in tr:
-            # несколько случайных окон из одного файла
             for _ in range(int(opts["aug_per_file"])):
                 y = _load_clip(path, deterministic=False)
                 S = _mel_from_wav(y)
@@ -156,4 +194,5 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"Saved model to {model_path}"
         ))
+
 
