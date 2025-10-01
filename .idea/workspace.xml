@@ -5,8 +5,23 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="f0027fec-8a9e-4fb9-bfe2-60e113c883e3" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/audio/learn/models.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/audio/learn/trigger_infer.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/audio/management/commands/train_triggers.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/beep/00210.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/beep/04269.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/beep/zvuk_skoraya-pomosch.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/8cb47ffa28ba9d7.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/chew-squishy_mjoumv4o.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/eating-with-mouth-lapping_mkqomsn_.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/kusanie-jabloka-i-chavkane.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/keyboard/cf9b99726102246.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/keyboard/f39f2b306e67b60.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/mouseclick/computer-mouse-clicks.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/ticktock/alarm_clock_ticking_loop_002.mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/ticktock/zvuk-chasov (1).mp3" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/data/triggers/ticktock/zvuk-chasov.mp3" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/pipeline.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/audio/realtime.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/realtime.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
     </list>
@@ -46,19 +61,33 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ASKED_SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
-    &quot;DefaultHtmlFileTemplate&quot;: &quot;HTML File&quot;,
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ASKED_SHARE_PROJECT_CONFIGURATION_FILES": "true",
+    "DefaultHtmlFileTemplate": "HTML File",
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
+    "git-widget-placeholder": "main",
+    "last_opened_file_path": "C:/Users/Nurken/PycharmProjects/NeuroTone",
+    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable"
   }
-}</component>
+}]]></component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone" />
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone\audio\data\triggers" />
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone\audio\data\triggers\beep" />
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone\data\triggers\beep" />
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone\data\triggers\mouseclick" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone" />
+      <recent name="C:\Users\Nurken\PycharmProjects\NeuroTone\audio" />
+    </key>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>

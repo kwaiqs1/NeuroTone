@@ -17,6 +17,13 @@ try:
 except Exception:
     _YAMNET_OK = False
 
+# NEW: локальная модель
+try:
+    from audio.learn.trigger_infer import LocalTriggerInfer
+    _LOCAL_OK = True
+except Exception:
+    _LOCAL_OK = False
+
 SR_SAFE_MIN = 16000
 SR_SAFE_MAX = 96000
 
@@ -37,9 +44,6 @@ def undb(x_db: float) -> float:
     return 10.0 ** (x_db / 20.0)
 
 def sqrt_hann(n: int) -> np.ndarray:
-    # Используем периодическую Хэннинга для корректного 50% OLA
-    # (анализ и синтез — sqrt(hann), шаг = n/2)
-    # np.hanning даёт симметричное окно; для STFT подойдёт и оно.
     h = np.hanning(n).astype(np.float32)
     h = np.sqrt(np.maximum(h, 1e-8))
     return h
@@ -49,22 +53,15 @@ class YamnetTrigger:
         self.enabled = _YAMNET_OK
         self.lock = threading.Lock()
         self.last_probs: Dict[str, float] = {}
-
-        # Имена ровно как в YAMNet (display_name в class map)
         self.targets_exact = {
             "Chewing, mastication", "Lip smacking",
             "Typing", "Computer keyboard", "Mouse click",
             "Tick-tock", "Knock", "Tap", "Clapping", "Keys jangling",
         }
-        # Небольшой tolerant-режим по подстроке (на случай минорных расхождений)
-        self.targets_sub = {
-            "chewing", "smacking", "typing", "keyboard", "mouse click",
-            "tick-tock", "knock", "tap", "clapping", "keys"
-        }
-
+        self.targets_sub = {"chewing","smacking","typing","keyboard","mouse click","tick-tock","knock","tap","clapping","keys"}
         self._acc_t = 0.0
-        self._period = 0.5  # каждые 0.5s обновляем вероятности
-        self._buf = np.zeros(16000, dtype=np.float32)  # рабочее окно для YAMNet
+        self._period = 0.5
+        self._buf = np.zeros(16000, dtype=np.float32)
         self._pos = 0
         self._decim = max(1, int(sr_stream // 16000))
         if self.enabled:
@@ -73,29 +70,20 @@ class YamnetTrigger:
                 path = self._yam.class_map_path().numpy().decode("utf-8")
                 with tf.io.gfile.GFile(path, "r") as f:
                     reader = csv.DictReader(f)
-                    self._labels = [
-                        (row.get("display_name") or row.get("name") or "").strip()
-                        for row in reader
-                    ]
+                    self._labels = [(row.get("display_name") or row.get("name") or "").strip() for row in reader]
             except Exception:
                 self.enabled = False
 
     def _label_is_target(self, name: str) -> bool:
-        if not name:
-            return False
-        if name in self.targets_exact:
-            return True
+        if not name: return False
+        if name in self.targets_exact: return True
         low = name.lower()
         return any(s in low for s in self.targets_sub)
 
     def push(self, x: np.ndarray, sr: int, dt: float):
-        if not self.enabled:
-            return
-        # Простая децимация в 16 кГц (достаточно надёжно для класс-детекции)
+        if not self.enabled: return
         x16 = x[::self._decim] if self._decim > 1 else x
-        if not x16.size:
-            return
-
+        if not x16.size: return
         n = x16.size
         end = self._pos + n
         if end <= self._buf.size:
@@ -103,18 +91,15 @@ class YamnetTrigger:
         else:
             k = self._buf.size - self._pos
             self._buf[self._pos:] = x16[:k]
-            self._buf[:n - k] = x16[k:]
+            self._buf[:n-k] = x16[k:]
         self._pos = (self._pos + n) % self._buf.size
-
         self._acc_t += dt
-        if self._acc_t < self._period:
-            return
+        if self._acc_t < self._period: return
         self._acc_t = 0.0
-
         try:
             wav = np.copy(self._buf).astype(np.float32)
-            scores, _, _ = self._yam(wav)  # [frames, classes]
-            p = np.mean(scores.numpy(), axis=0)  # усредняем по времени
+            scores, _, _ = self._yam(wav)
+            p = np.mean(scores.numpy(), axis=0)
             top = {}
             for i, pr in enumerate(p):
                 name = self._labels[i] if i < len(self._labels) else str(i)
@@ -123,17 +108,13 @@ class YamnetTrigger:
             with self.lock:
                 self.last_probs = top
         except Exception:
-            # молча, чтобы не ронять RT
             pass
 
     def boost(self) -> float:
-        if not self.enabled:
-            return 0.0
+        if not self.enabled: return 0.0
         with self.lock:
-            if not self.last_probs:
-                return 0.0
+            if not self.last_probs: return 0.0
             m = max(self.last_probs.values())
-        # Нормируем: 0.1 → 0.5 как «средняя уверенность»
         return float(np.clip((m - 0.1) / 0.4, 0.0, 1.0))
 
 class RealTimeProcessor:
@@ -148,9 +129,7 @@ class RealTimeProcessor:
         self.win = sqrt_hann(nfft)
         self.eps = 1e-8
 
-        # DC/низкочастотный гул подрезаем
         self.hpf = butter(2, 60 / (self.sr / 2), btype='highpass', output='sos')
-
         lpf_cut = min(16000, int(self.sr * 0.45))
         self.lpf = butter(4, lpf_cut / (self.sr / 2), btype='lowpass', output='sos')
 
@@ -165,13 +144,9 @@ class RealTimeProcessor:
         self.vad_hist = 0.0
 
         self.yam = YamnetTrigger(self.sr)
-
+        # NEW: локальная модель (необязательно: включится, если модель сохранена)
+        self.local = LocalTriggerInfer(sr_stream=self.sr) if _LOCAL_OK else None
         self.last_mag = np.zeros(self.nfft // 2 + 1, dtype=np.float32)
-
-        # Комфорт-шум (shape noize-floor) — готовим заготовку
-        rng = np.random.default_rng(123)
-        w = rng.standard_normal(self.nfft).astype(np.float32)
-        self.comfort = (w / (np.max(np.abs(w)) + self.eps)) * undb(-62)
 
     def _energy_band(self, x: np.ndarray, lo=200, hi=4000) -> float:
         X = np.fft.rfft(x * self.win[:x.size], n=self.nfft)
@@ -187,68 +162,93 @@ class RealTimeProcessor:
         self.vad_hist = 0.9 * self.vad_hist + 0.1 * p
         return float(np.clip(self.vad_hist, 0.0, 1.0))
 
-    def _process_frame(self, frame: np.ndarray, p_speech: float, trig_boost: float) -> np.ndarray:
+    def _process_frame(self, frame: np.ndarray, p_speech: float,
+                       yam_boost: float, local_probs: Dict[str,float]) -> np.ndarray:
         X = np.fft.rfft(frame * self.win)
         mag = np.abs(X).astype(np.float32)
         phase = np.angle(X).astype(np.float32)
 
-        # Адаптация оценки шума: быстрее вне речи
         upd = self.alpha_noise if p_speech > 0.4 else 0.80
         self.noise_psd = upd * self.noise_psd + (1.0 - upd) * (mag ** 2)
 
         y = mag.copy()
 
         if self.cfg.enable_denoise:
-            # База подавления + усиление при триггерах
+            # Итоговый «триггер-буст»: максимум из YAMNet и локальной
+            loc_boost = 0.0
+            if local_probs:
+                m = max(local_probs.get(k,0.0) for k in ["chewing","ticktock","keyboard","mouseclick"] + ["beep"])
+                # нормируем как в LocalTriggerInfer.boost()
+                loc_boost = float(np.clip((m - 0.3) / 0.6, 0.0, 1.0))
+            trig_boost = max(yam_boost, loc_boost)
+
             base_alpha = 2.2 + (1.6 if self.cfg.ultra_anc else 0.0) + 1.6 * trig_boost
             noise = np.maximum(self.noise_psd, 1e-12)
             snr = np.maximum((mag ** 2) / noise - 1.0, 0.0)
             wiener = snr / (snr + 1.0 + 1e-9)
 
-            # Дополнительное «перенасыщение» подавления (с учётом речи)
             over = base_alpha * (1.0 - 0.55 * p_speech)
             gain = np.clip(wiener - over * np.sqrt(noise) / (mag + 1e-9), 0.0, 1.0)
 
-            # Быстрые ВЧ-транзиенты (тик-так, клава, клики): срез
+            # Базовая антиклик-маска по всплескам
             hf_lo = hz_to_bin(1800, self.nfft, self.sr)
             crest = np.maximum(0.0, (mag - (0.88 * self.last_mag + 1e-6)) / (self.last_mag + 1e-6))
             tk = np.zeros_like(mag)
-            # Больше чувствительности к всплескам + завязка на настройку пользователя
             tk[hf_lo:] = np.clip(crest[hf_lo:] - (0.55 - self.cfg.trigger_sensitivity), 0.0, 1.0)
             self.last_mag = 0.9 * self.last_mag + 0.1 * mag
             gain *= (1.0 - 0.88 * tk)
 
-            # Сохраняем полосу речи
+            # NEW: контекстная полосовая выемка по локальным классам
+            f_bins = np.linspace(0, self.sr/2, mag.size)
+            def cut_band(lo, hi, depth=0.6):
+                i0, i1 = hz_to_bin(lo, self.nfft, self.sr), hz_to_bin(hi, self.nfft, self.sr)
+                d = np.clip(depth, 0.0, 0.95)
+                gain[i0:i1+1] *= (1.0 - d)
+
+            if local_probs:
+                # chewing: низ + верхние форманты слюновых звуков
+                if local_probs.get("chewing", 0.0) >= 0.5:
+                    cut_band(180, 1200, depth=0.55 * (1.0 + trig_boost))
+                    cut_band(6000, 9000, depth=0.50 * (1.0 + trig_boost))
+                # тик-так / клава / клик мыши: HF-транзиенты
+                if max(local_probs.get("ticktock",0.0), local_probs.get("keyboard",0.0), local_probs.get("mouseclick",0.0)) >= 0.45:
+                    cut_band(2000, 9000, depth=0.60 * (1.0 + trig_boost))
+
+                # важный звук? (например, beep) — НЕ углубляем вакуум
+                important = local_probs.get("beep", 0.0) >= 0.5
+            else:
+                important = False
+
+            # Защита речи
             if self.cfg.protect_speech and p_speech > 0.15:
                 lo, hi = hz_to_bin(250, self.nfft, self.sr), hz_to_bin(3800, self.nfft, self.sr)
                 protect = 0.3 + 0.7 * (1.0 - self.cfg.trigger_sensitivity)
                 gain[lo:hi] = np.maximum(gain[lo:hi], protect * 0.4)
 
-            # Плавность по времени (анти-«водопад»)
             self.prev_gain = 0.75 * self.prev_gain + 0.25 * gain
             gain = self.prev_gain
 
-            # Минимальный уровень подавления с учётом «вакуума»
             min_gain = undb(-38.0 - 10.0 * float(self.cfg.vacuum_strength))
             gain = np.clip(gain, min_gain, 1.0)
-
             y *= gain
 
-        # Пост-вакуум: дополнительно затихаем вне речи (очень мягко при речи)
+        # Вакуум: ослабляем вне речи. Если важный звук — делаем мягче.
         if self.cfg.enable_vacuum:
             vac = np.clip(self.cfg.vacuum_strength, 0.0, 1.0)
-            att = 16.0 + 16.0 * vac + 8.0 * trig_boost  # дБ
+            # если «important», уменьшаем аттенюацию на 40%
+            att = (16.0 + 16.0 * vac) * (0.6 if (local_probs and local_probs.get("beep",0.0)>=0.5) else 1.0)
+            # при триггерах усиливаем
+            if local_probs:
+                b = max(local_probs.get(k,0.0) for k in ["chewing","ticktock","keyboard","mouseclick"])
+                att += 8.0 * float(np.clip((b - 0.3)/0.6, 0.0, 1.0))
             post = undb(-att) ** (1.0 - p_speech)
             y *= post
 
-        # Спектральный «пол» (shape по оценке шума) — меньше музыкальных артефактов
         floor = undb(-62.0)
         y = np.maximum(y, floor * np.sqrt(self.noise_psd))
 
         Y = y * np.exp(1j * phase)
         y_time = np.fft.irfft(Y).real.astype(np.float32)
-
-        # Лёгкий LPF для сглаживания артефактов
         y_time = sosfilt(self.lpf, y_time)
         return y_time
 
@@ -259,7 +259,13 @@ class RealTimeProcessor:
 
         dt = len(x) / float(self.sr)
         self.yam.push(x, self.sr, dt)
-        trig_boost = self.yam.boost() if self.cfg.enable_triggers else 0.0
+        yam_boost = self.yam.boost() if self.cfg.enable_triggers else 0.0
+
+        local_probs = {}
+        if self.cfg.enable_triggers and self.local and self.local.enabled:
+            self.local.push(x, self.sr, dt)
+            local_probs = self.local.get_probs()
+
         p_speech_now = self._vad(x) if self.cfg.protect_speech else 0.0
 
         self._inbuf = np.concatenate([self._inbuf, x])
@@ -273,12 +279,10 @@ class RealTimeProcessor:
             self._prev_tail = frame[self.hop:]
             self._inbuf = self._inbuf[self.hop:]
 
-            # Плавная оценка речи
             p_speech = 0.7 * self.vad_hist + 0.3 * p_speech_now
 
-            y_frame = self._process_frame(frame, p_speech, trig_boost)
+            y_frame = self._process_frame(frame, p_speech, yam_boost, local_probs)
 
-            # Синтез через sqrt-hann и OLA
             a = y_frame[:self.hop] * self.win[:self.hop]
             b = y_frame[self.hop:] * self.win[self.hop:]
 
@@ -288,7 +292,6 @@ class RealTimeProcessor:
 
             mixed = (self._outbuf[:self.hop] + a)
             out_chunks.append(mixed.astype(np.float32))
-
             self._outbuf = b.copy()
 
         total_len = len(x)
@@ -308,7 +311,6 @@ class RealTimeProcessor:
         elif y.size > total_len:
             y = y[:total_len]
 
-        # Простой софт-лимитер
         peak = float(np.max(np.abs(y)) + 1e-9)
         if peak > 1.0:
             y = y / peak
