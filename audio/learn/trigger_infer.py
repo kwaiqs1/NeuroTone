@@ -1,3 +1,5 @@
+# audio/learn/trigger_infer.py
+
 import os, json
 from typing import Dict
 import numpy as np
@@ -9,8 +11,6 @@ class LocalTriggerInfer:
     Совместима с реалтаймом (push/get_probs/boost).
     """
     def __init__(self, model_dir: str = "models", sr_stream: int = 48000):
-        self.model_path   = os.path.join(model_dir, "trigger_cls_keras.h5")
-        self.classes_path = os.path.join(model_dir, "trigger_classes.json")
         self.enabled = False
 
         self.sr = int(sr_stream)
@@ -29,7 +29,22 @@ class LocalTriggerInfer:
         self.fmin, self.fmax = 40.0, 8000.0
         self.fix_T  = 120
 
-        if os.path.exists(self.model_path) and os.path.exists(self.classes_path):
+        base = "trigger_cls_keras"
+        self.classes_path = os.path.join(model_dir, "trigger_classes.json")
+        # Ищем в порядке: .h5 -> .keras -> каталог SavedModel
+        candidates = [
+            os.path.join(model_dir, base + ".h5"),
+            os.path.join(model_dir, base + ".keras"),
+            os.path.join(model_dir, base),             # SavedModel (каталог)
+            os.path.join(model_dir, base + "_saved"),  # запасной вариант, если решишь так назвать
+        ]
+        self.model_path = None
+        for p in candidates:
+            if os.path.exists(p):
+                self.model_path = p
+                break
+
+        if self.model_path and os.path.exists(self.classes_path):
             try:
                 self.model = tf.keras.models.load_model(self.model_path)
                 with open(self.classes_path, "r", encoding="utf-8") as f:
@@ -37,6 +52,8 @@ class LocalTriggerInfer:
                 self.enabled = True
             except Exception:
                 self.enabled = False
+
+
 
     @staticmethod
     def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-10, top_db: float = 80.0) -> np.ndarray:

@@ -1,3 +1,4 @@
+# audio/management/commands/train_triggers.py
 import os, json, random
 import subprocess, shutil
 from typing import List, Tuple
@@ -149,6 +150,9 @@ class Command(BaseCommand):
         parser.add_argument("--val_split", type=float, default=0.15)
         parser.add_argument("--aug_per_file", type=int, default=2,
                             help="сколько случайных окон генерировать с одного файла (train)")
+        parser.add_argument("--resume", action="store_true",
+                            help="Продолжить обучение с уже сохранённой модели, если найдена")
+
 
     def handle(self, *args, **opts):
         os.makedirs(MODEL_DIR, exist_ok=True)
@@ -179,6 +183,29 @@ class Command(BaseCommand):
         X_val = np.stack(X_val, axis=0).astype(np.float32)
         y_val = np.array(y_val, dtype=np.int64)
 
+
+
+        model = None
+        if opts.get("resume"):
+            for cand in [os.path.join(MODEL_DIR, "trigger_cls_keras.h5"),
+                         os.path.join(MODEL_DIR, "trigger_cls_keras"),
+                         os.path.join(MODEL_DIR, "trigger_cls_keras.keras")]:
+                if os.path.exists(cand):
+                    try:
+                        model = keras.models.load_model(cand)
+                        break
+                    except Exception:
+                        pass
+        if model is None:
+            model = build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=len(classes))
+        else:
+            # на случай изменения числа классов — простой safety-чек
+            if model.output_shape[-1] != len(classes):
+                model = build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=len(classes))
+
+
+
+
         model = build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=len(classes))
         cb = [
             keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=3, min_lr=1e-5, verbose=1),
@@ -197,25 +224,118 @@ class Command(BaseCommand):
         self.stdout.write(f"Final val_acc={val_acc:.3f}")
 
         # сохраняем
-        model_path = os.path.join(MODEL_DIR, "trigger_cls_keras.h5")
-        model.save(model_path)
+        model_path_h5 = os.path.join(MODEL_DIR, "trigger_cls_keras.h5")
+        model_dir_tf  = os.path.join(MODEL_DIR, "trigger_cls_keras")  # каталог SavedModel
+
+        saved_to = None
+        try:
+            # если h5py установлен — сохраняем в .h5
+            import h5py  # noqa: F401
+            model.save(model_path_h5)
+            saved_to = model_path_h5
+        except Exception as e:
+            # иначе сохраняем как SavedModel (каталог), h5py не нужен
+            self.stdout.write(self.style.WARNING(
+                f"Не получилось сохранить в .h5 ({e}). Сохраняю как SavedModel каталог: {model_dir_tf}"
+            ))
+            try:
+                if os.path.isdir(model_dir_tf):
+                    shutil.rmtree(model_dir_tf)
+            except Exception:
+                pass
+            # Для tf.keras (TF 2.x) сохранение в путь-без-расширения -> SavedModel
+            model.save(model_dir_tf)
+            saved_to = model_dir_tf
+
         with open(os.path.join(MODEL_DIR, "trigger_classes.json"), "w", encoding="utf-8") as f:
             json.dump(classes, f, ensure_ascii=False, indent=2)
-        self.stdout.write(self.style.SUCCESS(
-            f"Saved model to {model_path}"
-        ))
 
+        self.stdout.write(self.style.SUCCESS(f"Saved model to {saved_to}"))
 
 
 
 def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg не найден в PATH. Установи ffmpeg (winget install Gyan.FFmpeg или choco install ffmpeg), либо конвертируй проблемные файлы в WAV.")
-    cmd = [
-        "ffmpeg", "-v", "error", "-i", path,
-        "-ac", "1", "-ar", str(target_sr),
-        "-f", "f32le", "pipe:1",
+    """
+    Надежное чтение через ffmpeg:
+    - добавляем WindowsApps в PATH (winget-алиасы),
+    - пробуем просто "ffmpeg",
+    - при неудаче перебираем типичные пути,
+    - жестко выдаем mono float32 @ target_sr в stdout.
+    """
+    import os
+
+    # 1) На Windows добавим WindowsApps в PATH (там лежат алиасы winget)
+    if os.name == "nt":
+        wa = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps")
+        if os.path.isdir(wa):
+            cur = os.environ.get("PATH", "")
+            if wa not in cur:
+                os.environ["PATH"] = wa + os.pathsep + cur
+
+    # 2) Базовая команда
+    base_cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", path,
+        "-map_metadata", "-1",
+        "-vn",
+        "-ac", "1",
+        "-ar", str(target_sr),
+        "-f", "f32le",
+        "pipe:1",
     ]
-    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
-    y = np.frombuffer(out, dtype=np.float32)
-    return y, target_sr
+
+    def _try_run(cmd0: str) -> np.ndarray:
+        cmd = [cmd0] + base_cmd[1:]
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+        if not out:
+            raise RuntimeError("ffmpeg вернул пустой вывод для файла: " + path)
+        return np.frombuffer(out, dtype=np.float32)
+
+    # 3) Пытаемся обычным путем
+    try:
+        y = _try_run("ffmpeg")
+        return y, target_sr
+    except FileNotFoundError:
+        pass  # попробуем найти по другим путям
+    except subprocess.CalledProcessError as e:
+        # ffmpeg найден, но файл/кодек сбоит — пробуем еще пути на случай конфликтов alias
+        last_err = e
+
+    # 4) Типичные пути в Windows
+    candidates = []
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA", "")
+        candidates += [
+            os.path.join(la, "Microsoft", "WindowsApps", "ffmpeg.exe"),
+            r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+        ]
+
+    for exe in candidates:
+        if os.path.exists(exe):
+            try:
+                y = _try_run(exe)
+                return y, target_sr
+            except Exception:
+                continue
+
+    # 5) Последняя попытка: переменная окружения FFMPEG_BIN (если задашь вручную)
+    ffenv = os.environ.get("FFMPEG_BIN")
+    if ffenv and os.path.exists(ffenv):
+        y = _try_run(ffenv)
+        return y, target_sr
+
+    # 6) Если дошли сюда — реально не нашли или не смогли декодировать
+    raise RuntimeError(
+        "ffmpeg не найден или недоступен из Python. "
+        "Решения: "
+        "а) перезапусти PowerShell/IDE после установки winget ffmpeg; "
+        "б) проверь, что в PATH есть %LOCALAPPDATA%\\Microsoft\\WindowsApps; "
+        "в) задай FFMPEG_BIN=полный_путь_к_ffmpeg.exe; "
+        "г) либо конвертируй аудио в WAV вручную."
+    )
+
