@@ -36,6 +36,10 @@ class RTConfig:
     enable_vacuum: bool = True
     enable_denoise: bool = True
     ultra_anc: bool = True
+    hard_mute_triggers: bool = True
+    hard_mute_db: float = 70.0
+    noise_floor_db: float = 80.0
+
 
 def hz_to_bin(hz: float, nfft: int, sr: int) -> int:
     return int(np.clip(round(hz * nfft / sr), 0, nfft // 2))
@@ -73,6 +77,8 @@ class YamnetTrigger:
                     self._labels = [(row.get("display_name") or row.get("name") or "").strip() for row in reader]
             except Exception:
                 self.enabled = False
+
+
 
     def _label_is_target(self, name: str) -> bool:
         if not name: return False
@@ -198,12 +204,47 @@ class RealTimeProcessor:
             self.last_mag = 0.9 * self.last_mag + 0.1 * mag
             gain *= (1.0 - 0.88 * tk)
 
-            # NEW: контекстная полосовая выемка по локальным классам
-            f_bins = np.linspace(0, self.sr/2, mag.size)
-            def cut_band(lo, hi, depth=0.6):
+
+
+            # NEW: контекстная полосовая выемка по локальным классам (с опцией hard mute)
+            hard_min = undb(-self.cfg.hard_mute_db)  # амплитудный минимум для hard mute
+            def cut_band(lo, hi, depth=0.6, hard=False):
                 i0, i1 = hz_to_bin(lo, self.nfft, self.sr), hz_to_bin(hi, self.nfft, self.sr)
-                d = np.clip(depth, 0.0, 0.95)
-                gain[i0:i1+1] *= (1.0 - d)
+                i1 = min(i1, gain.size - 1)
+                if i1 <= i0:
+                    return
+                if hard:
+                    # жёстко: ограничиваем итоговый gain до очень маленького значения
+                    gain[i0:i1+1] = np.minimum(gain[i0:i1+1], hard_min)
+                else:
+                    d = np.clip(depth, 0.0, 0.95)
+                    gain[i0:i1+1] *= (1.0 - d)
+
+            p_chew  = local_probs.get("chewing", 0.0) if local_probs else 0.0
+            p_click = max(local_probs.get("ticktock",0.0),
+                          local_probs.get("keyboard",0.0),
+                          local_probs.get("mouseclick",0.0)) if local_probs else 0.0
+            p_beep  = local_probs.get("beep", 0.0) if local_probs else 0.0
+
+            thr_soft = 0.45  # с этого начинаем явно резать
+            thr_hard = 0.55  # с этого включаем hard mute
+            allow_hard_now = self.cfg.hard_mute_triggers and not (self.cfg.protect_speech and p_speech > 0.15)
+
+            # chewing: низ + верхние форманты
+            if p_chew > thr_soft:
+                hard = allow_hard_now and (p_chew >= thr_hard)
+                cut_band(180, 1200, depth=0.55 * (1.0 + trig_boost), hard=hard)
+                cut_band(6000, 9000, depth=0.50 * (1.0 + trig_boost), hard=hard)
+
+            # тик-так / клава / клик мыши: высокочастотные транзиенты
+            if p_click > thr_soft:
+                hard = allow_hard_now and (p_click >= thr_hard)
+                cut_band(2000, 9000, depth=0.60 * (1.0 + trig_boost), hard=hard)
+
+            important = (p_beep >= 0.5)
+
+
+
 
             if local_probs:
                 # chewing: низ + верхние форманты слюновых звуков
@@ -244,7 +285,7 @@ class RealTimeProcessor:
             post = undb(-att) ** (1.0 - p_speech)
             y *= post
 
-        floor = undb(-62.0)
+        floor = undb(-self.cfg.noise_floor_db)
         y = np.maximum(y, floor * np.sqrt(self.noise_psd))
 
         Y = y * np.exp(1j * phase)

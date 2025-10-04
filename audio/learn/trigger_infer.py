@@ -17,10 +17,11 @@ class LocalTriggerInfer:
         self.target_sr = 16000
         self.decim = max(1, self.sr // self.target_sr)
 
-        self.buf = np.zeros(self.target_sr, dtype=np.float32)  # 1 сек окно @16k
+        self.win_sec = 1.2
+        self.buf = np.zeros(int(self.target_sr * self.win_sec), dtype=np.float32)
         self.pos = 0
         self.acc = 0.0
-        self.period = 0.5
+        self.period = 0.3
         self.last_probs: Dict[str, float] = {}
 
         self.n_mels = 64

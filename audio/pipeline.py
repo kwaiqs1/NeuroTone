@@ -11,6 +11,15 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import webrtcvad
 
+
+
+try:
+    from audio.learn.trigger_infer import LocalTriggerInfer
+    HAS_LOCAL = True
+except Exception:
+    HAS_LOCAL = False
+
+
 try:
     import noisereduce as nr
     HAS_NOISEREDUCE = True
@@ -79,6 +88,40 @@ class CalmCityPipeline:
         self.yamnet = hub.load(YAMNET_HANDLE)
         self.class_map = self._load_class_map()
         self.vad = webrtcvad.Vad(2)
+        self.local = LocalTriggerInfer(sr_stream=16000) if HAS_LOCAL else None
+
+
+
+    def _local_frame_scores(self, y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
+        """
+        Возвращает покадровые (шаг ~0.5с) вероятности локальных классов:
+        chewing, ticktock, keyboard, mouseclick, beep
+        """
+        if self.local is None or not self.local.enabled:
+            return {}
+
+        y16 = _resample_to(y, sr, 16000)
+        win = self.local.target_sr                      # 1.0 c
+        hop = int(0.5 * self.local.target_sr)           # 0.5 c
+
+        keys = ["chewing", "ticktock", "keyboard", "mouseclick", "beep"]
+        acc = {k: [] for k in keys}
+
+        if y16.size < win:
+            seg = np.pad(y16, (0, win - y16.size))
+            p = self.local._probs(seg)
+            for k in keys:
+                acc[k].append(float(p.get(k, 0.0)))
+        else:
+            for i in range(0, y16.size - win + 1, hop):
+                seg = y16[i:i+win]
+                p = self.local._probs(seg)
+                for k in keys:
+                    acc[k].append(float(p.get(k, 0.0)))
+
+        return {k: np.array(v, dtype=np.float32) if len(v) else np.zeros((0,), np.float32) for k, v in acc.items()}
+
+
 
     def _load_class_map(self):
         class_map_path = self.yamnet.class_map_path().numpy().decode('utf-8')
@@ -196,9 +239,11 @@ class CalmCityPipeline:
                     G[:, i] *= base_vacuum
 
         BANDS = {
-            'clock':    [(2000, 9000)],
-            'keyboard': [(2000, 6500)],
-            'chewing':  [(180, 1200), (6000, 9500)],
+            'clock':     [(2000, 9000)],
+            'ticktock':  [(2000, 9000)],
+            'keyboard':  [(2000, 6500)],
+            'mouseclick':[(2000, 9000)],
+            'chewing':   [(180, 1200), (6000, 9500)],
         }
         f_bins = np.linspace(0, sr/2, F)
 
@@ -235,6 +280,8 @@ class CalmCityPipeline:
             y_out = 0.95 * (y_out / peak)
         return y_out
 
+
+
     def process_file(self, in_path: str, out_path: str, config: PipelineConfig) -> Dict:
         sens = 0.12 if config.trigger_sensitivity in (None, '') else float(config.trigger_sensitivity)
         vacs = 0.9  if config.vacuum_strength    in (None, '') else float(config.vacuum_strength)
@@ -242,6 +289,36 @@ class CalmCityPipeline:
         y, sr = _read_wav_mono_float(in_path)
 
         trig_frames = self._frame_trigger_scores(y, sr) if config.suppress_triggers else {}
+
+
+
+
+
+        if config.suppress_triggers and self.local and self.local.enabled:
+            loc = self._local_frame_scores(y, sr)
+
+            def _stretch(v: np.ndarray, L: int) -> np.ndarray:
+                if v.size == 0:
+                    return np.zeros(L, dtype=np.float32)
+                idx = (np.arange(L) * v.size) // max(v.size, 1)
+                idx = np.clip(idx, 0, v.size - 1)
+                return v[idx]
+
+            # Сливаем по ключам: если ключ совпадает, берём поэлементный максимум (после выравнивания длины)
+            for k, arr in loc.items():
+                if k in trig_frames:
+                    a, b = trig_frames[k], arr
+                    if a.size and b.size:
+                        L = max(a.size, b.size)
+                        trig_frames[k] = np.maximum(_stretch(a, L), _stretch(b, L))
+                    else:
+                        trig_frames[k] = a if a.size else b
+                else:
+                    trig_frames[k] = arr
+
+
+
+
 
         if config.base_denoise and HAS_NOISEREDUCE:
             # Лёгкий стационарный гейт до нашей маски — меньше «фона» на входе

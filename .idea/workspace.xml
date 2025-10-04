@@ -5,39 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="f0027fec-8a9e-4fb9-bfe2-60e113c883e3" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/data/triggers/beep/00210 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/beep/04269 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/beep/zvuk_skoraya-pomosch (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/8cb47ffa28ba9d7 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/chew-squishy_mjoumv4o.wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/chewing-29789 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/chewing-45887 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/eating-with-mouth-lapping_mkqomsn_ (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/chewing/kusanie-jabloka-i-chavkane (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/keyboard/cf9b99726102246 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/keyboard/f39f2b306e67b60 (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/mouseclick/computer-mouse-clicks (online-audio-converter.com).wav" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/data/triggers/ticktock/zvuk-chasov (1) (online-audio-converter.com).wav" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/forms.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/forms.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/audio/learn/trigger_infer.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/learn/trigger_infer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/management/commands/train_triggers.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/management/commands/train_triggers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/models.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/models.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/urls.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/urls.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/audio/views.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/views.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/beep/00210.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/beep/04269.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/beep/zvuk_skoraya-pomosch.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/chewing/8cb47ffa28ba9d7.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/chewing/chew-squishy_mjoumv4o.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/chewing/eating-with-mouth-lapping_mkqomsn_.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/chewing/kusanie-jabloka-i-chavkane.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/keyboard/cf9b99726102246.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/keyboard/f39f2b306e67b60.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/mouseclick/computer-mouse-clicks.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/ticktock/alarm_clock_ticking_loop_002.mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/ticktock/zvuk-chasov (1).mp3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/data/triggers/ticktock/zvuk-chasov.mp3" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/audio/pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/audio/realtime.py" beforeDir="false" afterPath="$PROJECT_DIR$/audio/realtime.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/db.sqlite3" beforeDir="false" afterPath="$PROJECT_DIR$/db.sqlite3" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
