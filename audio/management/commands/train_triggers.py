@@ -1,4 +1,5 @@
 import os, json, random
+import subprocess, shutil
 from typing import List, Tuple
 import numpy as np
 import soundfile as sf
@@ -41,10 +42,16 @@ def _scan_files() -> Tuple[List[Tuple[str,int]], List[str]]:
     return files, classes
 
 def _read_mono_32f(path: str) -> Tuple[np.ndarray, int]:
-    y, sr = sf.read(path, always_2d=False, dtype="float32")
-    if y.ndim == 2:
-        y = y.mean(axis=1)
-    return y.astype(np.float32), int(sr)
+    try:
+        y, sr = sf.read(path, always_2d=False, dtype="float32")
+        if y.ndim == 2:
+            y = y.mean(axis=1)
+        return y.astype(np.float32), int(sr)
+    except Exception:
+        # Надёжный путь на любые форматы/битые теги
+        y, sr = _ffmpeg_read_mono_32f(path, TARGET_SR)
+        return y, sr
+
 
 def _resample_if_needed(y: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
     if sr == target_sr:
@@ -59,12 +66,15 @@ def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-
     S = np.maximum(S, amin)
     log_spec = 10.0 * np.log10(S)
     if np.isscalar(ref):
+        # ВАЖНО: защититься от ref=0
+        ref = max(float(ref), amin)
         log_spec -= 10.0 * np.log10(ref)
     else:
         log_spec -= 10.0 * np.log10(np.maximum(ref, amin))
     if top_db is not None:
         log_spec = np.maximum(log_spec, log_spec.max() - float(top_db))
     return log_spec
+
 
 def _mel_from_wav(y16: np.ndarray) -> np.ndarray:
     # центрирование как в librosa(center=True): паддинг половины окна
@@ -196,3 +206,16 @@ class Command(BaseCommand):
         ))
 
 
+
+
+def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg не найден в PATH. Установи ffmpeg (winget install Gyan.FFmpeg или choco install ffmpeg), либо конвертируй проблемные файлы в WAV.")
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", path,
+        "-ac", "1", "-ar", str(target_sr),
+        "-f", "f32le", "pipe:1",
+    ]
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+    y = np.frombuffer(out, dtype=np.float32)
+    return y, target_sr

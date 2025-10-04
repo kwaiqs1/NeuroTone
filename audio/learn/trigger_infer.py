@@ -43,12 +43,14 @@ class LocalTriggerInfer:
         S = np.maximum(S, amin)
         log_spec = 10.0 * np.log10(S)
         if np.isscalar(ref):
+            ref = max(float(ref), amin)  # <-- защита
             log_spec -= 10.0 * np.log10(ref)
         else:
             log_spec -= 10.0 * np.log10(np.maximum(ref, amin))
         if top_db is not None:
             log_spec = np.maximum(log_spec, log_spec.max() - float(top_db))
         return log_spec
+
 
     def _mel_from_wav(self, y16: np.ndarray) -> np.ndarray:
         pad = self.n_fft // 2
