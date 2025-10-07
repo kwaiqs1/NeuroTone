@@ -11,14 +11,11 @@ import tensorflow as tf
 import tensorflow_hub as hub
 import webrtcvad
 
-
-
 try:
     from audio.learn.trigger_infer import LocalTriggerInfer
     HAS_LOCAL = True
 except Exception:
     HAS_LOCAL = False
-
 
 try:
     import noisereduce as nr
@@ -42,6 +39,24 @@ class PipelineConfig:
     preserve_speech: bool = True
     vacuum_mode: bool = True
     vacuum_strength: float = 0.9
+    # NEW: жёсткое приглушение триггеров в оффлайне (резерв на будущее — можно вывести в форму)
+    hard_mute_triggers: bool = True
+    hard_mute_db: float = 70.0      # до какого уровня опускать (амплитуда ~ -70 dB)
+    noise_floor_db: float = 80.0    # защитный пол «шума», чтобы избежать цифровой тишины
+
+# --- утилиты ---
+def undb(db: float) -> float:
+    return 10.0 ** (db / 20.0)
+
+def _dilate(mask: np.ndarray, radius: int = 2) -> np.ndarray:
+    """Логическая дилатация по времени: расширяет True на +/- radius шагов."""
+    if mask.size == 0:
+        return mask
+    out = mask.copy()
+    for r in range(1, radius + 1):
+        out[:-r] |= mask[r:]
+        out[r:]  |= mask[:-r]
+    return out
 
 # ---------- WAV I/O ----------
 def _read_wav_mono_float(path: str) -> Tuple[np.ndarray, int]:
@@ -90,8 +105,6 @@ class CalmCityPipeline:
         self.vad = webrtcvad.Vad(2)
         self.local = LocalTriggerInfer(sr_stream=16000) if HAS_LOCAL else None
 
-
-
     def _local_frame_scores(self, y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
         """
         Возвращает покадровые (шаг ~0.5с) вероятности локальных классов:
@@ -120,8 +133,6 @@ class CalmCityPipeline:
                     acc[k].append(float(p.get(k, 0.0)))
 
         return {k: np.array(v, dtype=np.float32) if len(v) else np.zeros((0,), np.float32) for k, v in acc.items()}
-
-
 
     def _load_class_map(self):
         class_map_path = self.yamnet.class_map_path().numpy().decode('utf-8')
@@ -222,8 +233,10 @@ class CalmCityPipeline:
         else:
             vad_t = np.zeros(T, dtype=np.bool_)
 
-        yam_t = {}
+        # Выровняем все триггерные вероятности к длине STFT
+        yam_t: Dict[str, np.ndarray] = {}
         for key, arr in trig_frames.items():
+            # важно: масштабируем от длины STFT (T) к длине массива вероятностей (arr.size)
             map_y = np.minimum((np.arange(T) * arr.size) // max(T, 1), max(arr.size - 1, 0))
             yam_t[key] = arr[map_y] if arr.size > 0 else np.zeros(T, dtype=np.float32)
 
@@ -248,9 +261,25 @@ class CalmCityPipeline:
         f_bins = np.linspace(0, sr/2, F)
 
         thr = float(0.12 if sensitivity in (None, '') else sensitivity)
+        # Отдельные пороги для мягкого/жёсткого mute
+        thr_soft = max(0.45, thr)         # от этого порога начинаем явно резать
+        thr_hard = max(0.55, thr + 0.05)  # от этого порога включаем hard mute
 
-        MIN_GAIN_OUT = 0.01
-        MIN_GAIN_SPEECH = 0.12
+        # Сформируем логмаски по времени с дилатацией — закрыть весь "кусок" события
+        chew_p   = yam_t.get("chewing", np.zeros(T, np.float32))
+        kbd_p    = yam_t.get("keyboard", np.zeros(T, np.float32))
+        clk_p    = yam_t.get("mouseclick", np.zeros(T, np.float32))
+        tck_p    = yam_t.get("ticktock", np.zeros(T, np.float32))
+        click_p  = np.maximum.reduce([kbd_p, clk_p, tck_p]) if T else np.zeros(T, np.float32)
+
+        chew_soft = _dilate(chew_p  >  thr_soft, 2)
+        chew_hard = _dilate(chew_p  >= thr_hard, 3)
+        clk_soft  = _dilate(click_p >  thr_soft, 2)
+        clk_hard  = _dilate(click_p >= thr_hard, 3)
+
+        MIN_GAIN_OUT = undb(-80.0)     # ≈ 0.0001 — почти тишина
+        MIN_GAIN_SPEECH = undb(-38.0)  # бережём речь в коридоре частот
+        hard_min = undb(-70.0) if protect_speech else undb(-80.0)
 
         for i in range(T):
             is_speech = bool(vad_t[i])
@@ -259,28 +288,40 @@ class CalmCityPipeline:
                 band = (f_bins >= 2000) & (f_bins <= 9000)
                 G[band, i] *= 0.15 if not is_speech else 0.35
 
-            for key, bands in BANDS.items():
-                s = float(yam_t.get(key, np.zeros((), np.float32))[i]) if key in yam_t else 0.0
-                if s > thr:
-                    k = np.clip((s - thr) / max(1e-6, 1.0 - thr), 0.0, 1.0)  # 0..1
+            def _apply(lo, hi, hard: bool, depth: float):
+                band = (f_bins >= lo) & (f_bins <= hi)
+                if hard and (not (is_speech and protect_speech)):
+                    G[band, i] = np.minimum(G[band, i], hard_min)  # жёсткий mute
+                else:
                     target_min = MIN_GAIN_SPEECH if (is_speech and protect_speech) else MIN_GAIN_OUT
-                    depth = 0.6 + 0.4 * k
-                    gain = np.clip(1.0 - depth, target_min, 1.0)
-                    for (lo, hi) in bands:
-                        band = (f_bins >= lo) & (f_bins <= hi)
-                        G[band, i] *= gain
+                    G[band, i] = np.maximum(G[band, i] * (1.0 - depth), target_min)
+
+            # chewing: низ + верхние форманты
+            if chew_soft[i] or chew_hard[i]:
+                hard = bool(chew_hard[i]) and bool(vad_t.size == 0 or not is_speech)
+                _apply(180, 1200, hard=hard, depth=0.65)
+                _apply(6000, 9500, hard=hard, depth=0.60)
+
+            # click/keyboard/ticktock: HF транзиенты
+            if clk_soft[i] or clk_hard[i]:
+                hard = bool(clk_hard[i]) and bool(vad_t.size == 0 or not is_speech)
+                _apply(2000, 9000, hard=hard, depth=0.70)
 
         Z_proc = Z * G
         _, y_out = istft(Z_proc, fs=sr, nperseg=nper, noverlap=nover)
 
-        # Нормализация пика
+        # Выход: НЕ поднимаем уровень, только защищаемся от клипа
         y_out = y_out.astype(np.float32)
         peak = float(np.max(np.abs(y_out)) + 1e-9)
-        if peak > 0:
-            y_out = 0.95 * (y_out / peak)
+        if peak > 1.0:
+            y_out = y_out / peak
+
+        # Защитный пол шума (ультра-тихо), чтобы не было цифровых нулей/щелчков
+        noise_floor = undb(-float(80.0))  # можно заменить на config.noise_floor_db
+        y_out = np.clip(y_out, -1.0, 1.0)
+        small = np.abs(y_out) < noise_floor
+        y_out[small] = 0.0
         return y_out
-
-
 
     def process_file(self, in_path: str, out_path: str, config: PipelineConfig) -> Dict:
         sens = 0.12 if config.trigger_sensitivity in (None, '') else float(config.trigger_sensitivity)
@@ -289,10 +330,6 @@ class CalmCityPipeline:
         y, sr = _read_wav_mono_float(in_path)
 
         trig_frames = self._frame_trigger_scores(y, sr) if config.suppress_triggers else {}
-
-
-
-
 
         if config.suppress_triggers and self.local and self.local.enabled:
             loc = self._local_frame_scores(y, sr)
@@ -315,10 +352,6 @@ class CalmCityPipeline:
                         trig_frames[k] = a if a.size else b
                 else:
                     trig_frames[k] = arr
-
-
-
-
 
         if config.base_denoise and HAS_NOISEREDUCE:
             # Лёгкий стационарный гейт до нашей маски — меньше «фона» на входе
@@ -346,3 +379,4 @@ def get_pipeline() -> CalmCityPipeline:
     if _pipeline_singleton is None:
         _pipeline_singleton = CalmCityPipeline()
     return _pipeline_singleton
+
