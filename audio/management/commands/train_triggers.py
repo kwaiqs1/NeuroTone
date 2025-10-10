@@ -9,16 +9,15 @@ import tensorflow as tf
 from tensorflow import keras
 from django.core.management.base import BaseCommand
 
-# ---- Константы ----
 DATA_DIR   = "data/triggers"
 MODEL_DIR  = "models"
 N_MELS     = 64
 TARGET_SR  = 16000
-HOP        = 160           # 10 мс при 16 кГц
+HOP        = 160
 N_FFT      = 1024
 FMIN, FMAX = 40.0, 8000.0
-WIN_SEC    = 1.2           # длина окна для обучения/валидации
-FIX_T      = 120           # целевое число временных кадров (≈1.2 c / 10 мс)
+WIN_SEC    = 1.2
+FIX_T      = 120
 
 def _scan_files() -> Tuple[List[Tuple[str,int]], List[str]]:
     classes = []
@@ -49,7 +48,6 @@ def _read_mono_32f(path: str) -> Tuple[np.ndarray, int]:
             y = y.mean(axis=1)
         return y.astype(np.float32), int(sr)
     except Exception:
-        # Надёжный путь на любые форматы/битые теги
         y, sr = _ffmpeg_read_mono_32f(path, TARGET_SR)
         return y, sr
 
@@ -57,7 +55,6 @@ def _read_mono_32f(path: str) -> Tuple[np.ndarray, int]:
 def _resample_if_needed(y: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
     if sr == target_sr:
         return y.astype(np.float32)
-    # устойчивый и быстрый ресемплинг без numba
     g = np.gcd(int(sr), int(target_sr))
     up, down = target_sr // g, sr // g
     return resample_poly(y, up, down).astype(np.float32)
@@ -67,7 +64,6 @@ def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-
     S = np.maximum(S, amin)
     log_spec = 10.0 * np.log10(S)
     if np.isscalar(ref):
-        # ВАЖНО: защититься от ref=0
         ref = max(float(ref), amin)
         log_spec -= 10.0 * np.log10(ref)
     else:
@@ -78,7 +74,7 @@ def _power_to_db(S: np.ndarray, ref: float | np.ndarray = 1.0, amin: float = 1e-
 
 
 def _mel_from_wav(y16: np.ndarray) -> np.ndarray:
-    # центрирование как в librosa(center=True): паддинг половины окна
+
     pad = N_FFT // 2
     ypad = np.pad(y16, (pad, pad), mode="reflect").astype(np.float32)
 
@@ -86,7 +82,7 @@ def _mel_from_wav(y16: np.ndarray) -> np.ndarray:
         tf.convert_to_tensor(ypad, dtype=tf.float32),
         frame_length=N_FFT, frame_step=HOP,
         window_fn=tf.signal.hann_window, pad_end=False
-    )  # [T, F]
+    )
     power = tf.math.square(tf.abs(frames))  # [T, F]
     mel_w = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=N_MELS,
@@ -94,7 +90,7 @@ def _mel_from_wav(y16: np.ndarray) -> np.ndarray:
         sample_rate=TARGET_SR,
         lower_edge_hertz=FMIN,
         upper_edge_hertz=FMAX
-    )  # [F, M]
+    )
     mel = tf.matmul(power, mel_w)  # [T, M]
     mel = mel.numpy().astype(np.float32).T  # -> [M, T]
 
@@ -164,7 +160,7 @@ class Command(BaseCommand):
             f"Classes: {classes} | train={len(tr)} val={len(val)}"
         ))
 
-        # --- готовим данные ---
+
         X_tr, y_tr = [], []
         for path, cid in tr:
             for _ in range(int(opts["aug_per_file"])):
@@ -199,7 +195,6 @@ class Command(BaseCommand):
         if model is None:
             model = build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=len(classes))
         else:
-            # на случай изменения числа классов — простой safety-чек
             if model.output_shape[-1] != len(classes):
                 model = build_model(n_mels=N_MELS, t_frames=FIX_T, n_classes=len(classes))
 
@@ -223,18 +218,16 @@ class Command(BaseCommand):
         val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
         self.stdout.write(f"Final val_acc={val_acc:.3f}")
 
-        # сохраняем
+
         model_path_h5 = os.path.join(MODEL_DIR, "trigger_cls_keras.h5")
-        model_dir_tf  = os.path.join(MODEL_DIR, "trigger_cls_keras")  # каталог SavedModel
+        model_dir_tf  = os.path.join(MODEL_DIR, "trigger_cls_keras")
 
         saved_to = None
         try:
-            # если h5py установлен — сохраняем в .h5
             import h5py  # noqa: F401
             model.save(model_path_h5)
             saved_to = model_path_h5
         except Exception as e:
-            # иначе сохраняем как SavedModel (каталог), h5py не нужен
             self.stdout.write(self.style.WARNING(
                 f"Не получилось сохранить в .h5 ({e}). Сохраняю как SavedModel каталог: {model_dir_tf}"
             ))
@@ -243,7 +236,7 @@ class Command(BaseCommand):
                     shutil.rmtree(model_dir_tf)
             except Exception:
                 pass
-            # Для tf.keras (TF 2.x) сохранение в путь-без-расширения -> SavedModel
+
             model.save(model_dir_tf)
             saved_to = model_dir_tf
 
@@ -255,16 +248,8 @@ class Command(BaseCommand):
 
 
 def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
-    """
-    Надежное чтение через ffmpeg:
-    - добавляем WindowsApps в PATH (winget-алиасы),
-    - пробуем просто "ffmpeg",
-    - при неудаче перебираем типичные пути,
-    - жестко выдаем mono float32 @ target_sr в stdout.
-    """
     import os
 
-    # 1) На Windows добавим WindowsApps в PATH (там лежат алиасы winget)
     if os.name == "nt":
         wa = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps")
         if os.path.isdir(wa):
@@ -272,7 +257,7 @@ def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.nda
             if wa not in cur:
                 os.environ["PATH"] = wa + os.pathsep + cur
 
-    # 2) Базовая команда
+
     base_cmd = [
         "ffmpeg",
         "-nostdin",
@@ -294,17 +279,16 @@ def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.nda
             raise RuntimeError("ffmpeg вернул пустой вывод для файла: " + path)
         return np.frombuffer(out, dtype=np.float32)
 
-    # 3) Пытаемся обычным путем
+
     try:
         y = _try_run("ffmpeg")
         return y, target_sr
     except FileNotFoundError:
-        pass  # попробуем найти по другим путям
+        pass
     except subprocess.CalledProcessError as e:
-        # ffmpeg найден, но файл/кодек сбоит — пробуем еще пути на случай конфликтов alias
         last_err = e
 
-    # 4) Типичные пути в Windows
+
     candidates = []
     if os.name == "nt":
         la = os.environ.get("LOCALAPPDATA", "")
@@ -323,13 +307,13 @@ def _ffmpeg_read_mono_32f(path: str, target_sr: int = TARGET_SR) -> Tuple[np.nda
             except Exception:
                 continue
 
-    # 5) Последняя попытка: переменная окружения FFMPEG_BIN (если задашь вручную)
+
     ffenv = os.environ.get("FFMPEG_BIN")
     if ffenv and os.path.exists(ffenv):
         y = _try_run(ffenv)
         return y, target_sr
 
-    # 6) Если дошли сюда — реально не нашли или не смогли декодировать
+
     raise RuntimeError(
         "ffmpeg не найден или недоступен из Python. "
         "Решения: "

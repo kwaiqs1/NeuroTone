@@ -17,7 +17,7 @@ try:
 except Exception:
     _YAMNET_OK = False
 
-# NEW: локальная модель
+
 try:
     from audio.learn.trigger_infer import LocalTriggerInfer
     _LOCAL_OK = True
@@ -150,7 +150,6 @@ class RealTimeProcessor:
         self.vad_hist = 0.0
 
         self.yam = YamnetTrigger(self.sr)
-        # NEW: локальная модель (необязательно: включится, если модель сохранена)
         self.local = LocalTriggerInfer(sr_stream=self.sr) if _LOCAL_OK else None
         self.last_mag = np.zeros(self.nfft // 2 + 1, dtype=np.float32)
 
@@ -180,11 +179,9 @@ class RealTimeProcessor:
         y = mag.copy()
 
         if self.cfg.enable_denoise:
-            # Итоговый «триггер-буст»: максимум из YAMNet и локальной
             loc_boost = 0.0
             if local_probs:
                 m = max(local_probs.get(k,0.0) for k in ["chewing","ticktock","keyboard","mouseclick"] + ["beep"])
-                # нормируем как в LocalTriggerInfer.boost()
                 loc_boost = float(np.clip((m - 0.3) / 0.6, 0.0, 1.0))
             trig_boost = max(yam_boost, loc_boost)
 
@@ -196,7 +193,7 @@ class RealTimeProcessor:
             over = base_alpha * (1.0 - 0.55 * p_speech)
             gain = np.clip(wiener - over * np.sqrt(noise) / (mag + 1e-9), 0.0, 1.0)
 
-            # Базовая антиклик-маска по всплескам
+
             hf_lo = hz_to_bin(1800, self.nfft, self.sr)
             crest = np.maximum(0.0, (mag - (0.88 * self.last_mag + 1e-6)) / (self.last_mag + 1e-6))
             tk = np.zeros_like(mag)
@@ -206,15 +203,14 @@ class RealTimeProcessor:
 
 
 
-            # NEW: контекстная полосовая выемка по локальным классам (с опцией hard mute)
-            hard_min = undb(-self.cfg.hard_mute_db)  # амплитудный минимум для hard mute
+
+            hard_min = undb(-self.cfg.hard_mute_db)
             def cut_band(lo, hi, depth=0.6, hard=False):
                 i0, i1 = hz_to_bin(lo, self.nfft, self.sr), hz_to_bin(hi, self.nfft, self.sr)
                 i1 = min(i1, gain.size - 1)
                 if i1 <= i0:
                     return
                 if hard:
-                    # жёстко: ограничиваем итоговый gain до очень маленького значения
                     gain[i0:i1+1] = np.minimum(gain[i0:i1+1], hard_min)
                 else:
                     d = np.clip(depth, 0.0, 0.95)
@@ -226,17 +222,16 @@ class RealTimeProcessor:
                           local_probs.get("mouseclick",0.0)) if local_probs else 0.0
             p_beep  = local_probs.get("beep", 0.0) if local_probs else 0.0
 
-            thr_soft = 0.45  # с этого начинаем явно резать
-            thr_hard = 0.55  # с этого включаем hard mute
+            thr_soft = 0.45
+            thr_hard = 0.55
             allow_hard_now = self.cfg.hard_mute_triggers and not (self.cfg.protect_speech and p_speech > 0.15)
 
-            # chewing: низ + верхние форманты
+
             if p_chew > thr_soft:
                 hard = allow_hard_now and (p_chew >= thr_hard)
                 cut_band(180, 1200, depth=0.55 * (1.0 + trig_boost), hard=hard)
                 cut_band(6000, 9000, depth=0.50 * (1.0 + trig_boost), hard=hard)
 
-            # тик-так / клава / клик мыши: высокочастотные транзиенты
             if p_click > thr_soft:
                 hard = allow_hard_now and (p_click >= thr_hard)
                 cut_band(2000, 9000, depth=0.60 * (1.0 + trig_boost), hard=hard)
@@ -247,20 +242,17 @@ class RealTimeProcessor:
 
 
             if local_probs:
-                # chewing: низ + верхние форманты слюновых звуков
                 if local_probs.get("chewing", 0.0) >= 0.5:
                     cut_band(180, 1200, depth=0.55 * (1.0 + trig_boost))
                     cut_band(6000, 9000, depth=0.50 * (1.0 + trig_boost))
-                # тик-так / клава / клик мыши: HF-транзиенты
                 if max(local_probs.get("ticktock",0.0), local_probs.get("keyboard",0.0), local_probs.get("mouseclick",0.0)) >= 0.45:
                     cut_band(2000, 9000, depth=0.60 * (1.0 + trig_boost))
 
-                # важный звук? (например, beep) — НЕ углубляем вакуум
                 important = local_probs.get("beep", 0.0) >= 0.5
             else:
                 important = False
 
-            # Защита речи
+
             if self.cfg.protect_speech and p_speech > 0.15:
                 lo, hi = hz_to_bin(250, self.nfft, self.sr), hz_to_bin(3800, self.nfft, self.sr)
                 protect = 0.3 + 0.7 * (1.0 - self.cfg.trigger_sensitivity)
@@ -273,12 +265,9 @@ class RealTimeProcessor:
             gain = np.clip(gain, min_gain, 1.0)
             y *= gain
 
-        # Вакуум: ослабляем вне речи. Если важный звук — делаем мягче.
         if self.cfg.enable_vacuum:
             vac = np.clip(self.cfg.vacuum_strength, 0.0, 1.0)
-            # если «important», уменьшаем аттенюацию на 40%
             att = (16.0 + 16.0 * vac) * (0.6 if (local_probs and local_probs.get("beep",0.0)>=0.5) else 1.0)
-            # при триггерах усиливаем
             if local_probs:
                 b = max(local_probs.get(k,0.0) for k in ["chewing","ticktock","keyboard","mouseclick"])
                 att += 8.0 * float(np.clip((b - 0.3)/0.6, 0.0, 1.0))

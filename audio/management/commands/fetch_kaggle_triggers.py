@@ -7,8 +7,8 @@ import numpy as np
 from scipy.signal import resample_poly
 from django.core.management.base import BaseCommand
 
-EAT_DS   = "mashijie/eating-sound-collection"      # chewing
-NOISE_DS = "moazabdeljalil/back-ground-noise"      # negatives
+EAT_DS   = "mashijie/eating-sound-collection"
+NOISE_DS = "moazabdeljalil/back-ground-noise"
 
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -34,7 +34,6 @@ def _kaggle_download(dataset: str, out_dir: Path, only_wav: bool | None = True):
             if cols and cols[0].lower().endswith(".wav"):
                 wavs.append(cols[0])
         if not wavs:
-            # fallback: загрузим весь датасет
             print("[kaggle] no explicit .wav listing found, downloading whole dataset...")
             subprocess.run(["kaggle", "datasets", "download", "-d", dataset, "-p", str(out_dir), "--unzip", "--force"], check=True)
             return
@@ -47,7 +46,6 @@ def _kaggle_download(dataset: str, out_dir: Path, only_wav: bool | None = True):
                 )
             except subprocess.CalledProcessError:
                 continue
-        # распакуем всё, что zip
         for z in out_dir.glob("*.zip"):
             subprocess.run(["python", "-m", "zipfile", "-e", str(z), str(out_dir)], check=True)
             z.unlink(missing_ok=True)
@@ -101,7 +99,7 @@ class Command(BaseCommand):
         shutil.rmtree(neg_dir, ignore_errors=True)
         _ensure_dir(pos_dir); _ensure_dir(neg_dir)
 
-        # 1) chewing
+
         tmp_pos = cache / "chewing_raw"
         if tmp_pos.exists():
             print("[kaggle] reuse cache:", tmp_pos)
@@ -115,7 +113,6 @@ class Command(BaseCommand):
             try:
                 y, sr = _read_mono_float(p)
                 y = _resample(y, sr, sr_t)
-                # обрежем до 1.2с (как в тренере) — не обязательно, но экономит место
                 need = int(1.2 * sr_t)
                 if y.size < need:
                     y = np.pad(y, (0, need - y.size))
@@ -126,7 +123,7 @@ class Command(BaseCommand):
             except Exception:
                 continue
 
-        # 2) other (negatives) — возьмём фоновые шумы
+
         tmp_neg = cache / "bg_raw"
         if tmp_neg.exists():
             print("[kaggle] reuse cache:", tmp_neg)

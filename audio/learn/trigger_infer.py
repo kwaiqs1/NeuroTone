@@ -6,10 +6,6 @@ import numpy as np
 import tensorflow as tf
 
 class LocalTriggerInfer:
-    """
-    Keras-модель + TF-мелы, без librosa/soxr.
-    Совместима с реалтаймом (push/get_probs/boost).
-    """
     def __init__(self, model_dir: str = "models", sr_stream: int = 48000):
         self.enabled = False
 
@@ -32,12 +28,11 @@ class LocalTriggerInfer:
 
         base = "trigger_cls_keras"
         self.classes_path = os.path.join(model_dir, "trigger_classes.json")
-        # Ищем в порядке: .h5 -> .keras -> каталог SavedModel
         candidates = [
             os.path.join(model_dir, base + ".h5"),
             os.path.join(model_dir, base + ".keras"),
-            os.path.join(model_dir, base),             # SavedModel (каталог)
-            os.path.join(model_dir, base + "_saved"),  # запасной вариант, если решишь так назвать
+            os.path.join(model_dir, base),
+            os.path.join(model_dir, base + "_saved"),
         ]
         self.model_path = None
         for p in candidates:
@@ -61,7 +56,7 @@ class LocalTriggerInfer:
         S = np.maximum(S, amin)
         log_spec = 10.0 * np.log10(S)
         if np.isscalar(ref):
-            ref = max(float(ref), amin)  # <-- защита
+            ref = max(float(ref), amin)
             log_spec -= 10.0 * np.log10(ref)
         else:
             log_spec -= 10.0 * np.log10(np.maximum(ref, amin))
@@ -78,8 +73,8 @@ class LocalTriggerInfer:
             tf.convert_to_tensor(ypad, dtype=tf.float32),
             frame_length=self.n_fft, frame_step=self.hop,
             window_fn=tf.signal.hann_window, pad_end=False
-        )  # [T, F]
-        power = tf.math.square(tf.abs(frames))  # [T, F]
+        )
+        power = tf.math.square(tf.abs(frames))
 
         mel_w = tf.signal.linear_to_mel_weight_matrix(
             num_mel_bins=self.n_mels,
@@ -87,9 +82,9 @@ class LocalTriggerInfer:
             sample_rate=self.target_sr,
             lower_edge_hertz=self.fmin,
             upper_edge_hertz=self.fmax
-        )  # [F, M]
-        mel = tf.matmul(power, mel_w)  # [T, M]
-        mel = mel.numpy().astype(np.float32).T  # [M, T]
+        )
+        mel = tf.matmul(power, mel_w)
+        mel = mel.numpy().astype(np.float32).T
 
         S_db = self._power_to_db(mel, ref=np.max(mel))
         mu, std = S_db.mean(), S_db.std() + 1e-6
@@ -107,14 +102,14 @@ class LocalTriggerInfer:
         if not self.enabled:
             return {}
         S = self._mel_from_wav(wav16)
-        x = S[None, ..., None]  # [1, M, T, 1]
-        p = self.model.predict(x, verbose=0)[0]  # softmax
+        x = S[None, ..., None]
+        p = self.model.predict(x, verbose=0)[0]
         return { self.classes[i]: float(p[i]) for i in range(len(self.classes)) }
 
     def push(self, x: np.ndarray, sr: int, dt: float):
         if not self.enabled:
             return
-        # децимация до 16 кГц (простая, но быстрая)
+
         x16 = x[::self.decim] if self.decim > 1 else x
         if x16.size == 0:
             return
@@ -143,5 +138,4 @@ class LocalTriggerInfer:
         if not self.enabled or not self.last_probs:
             return 0.0
         m = max([self.last_probs.get(k, 0.0) for k in keys] + [0.0])
-        # картируем 0.3..0.9 -> 0..1
         return float(np.clip((m - 0.3) / 0.6, 0.0, 1.0))
